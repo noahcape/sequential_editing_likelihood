@@ -1,2 +1,4 @@
 /target
 /sims
+.vscode
+/py/__pycache__
