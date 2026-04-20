@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Sequence, Tuple
+from typing import Any, List, Mapping, Sequence, Tuple, MutableMapping
 
 import diffrax
 import equinox as eqx
@@ -92,7 +92,7 @@ class TapeState:
                         TapeState(tuple(leading + [gamma]), tuple(lagging), orientation)
                     )
                 orientation = TapeState.EVEN
-                
+
         preds.append(TapeState.empty())
         return preds
 
@@ -107,6 +107,29 @@ class TapeGraphArrays:
     edit_targets: jnp.ndarray
     transfer_targets: jnp.ndarray
     divide_targets: jnp.ndarray
+
+
+def populate_tape_graphs(
+    T: nx.DiGraph,
+    node,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
+    params: ModelParams,
+) -> TapeState:
+    if T.out_degree[node] == 0:
+        tape = T.nodes[node]["label"]
+        if not tape_graphs.__contains__(tape):
+            graph = build_tape_graph(T.nodes[node]["label"], params)
+            tape_graphs[tape] = graph
+        return tape
+    else:
+        a, b = T.neighbors(node)
+        tape_a = populate_tape_graphs(T, a, tape_graphs, params)
+        tape_b = populate_tape_graphs(T, b, tape_graphs, params)
+        lca = TapeState.lca(tape_a, tape_b)
+        if not tape_graphs.__contains__(lca):
+            graph = build_tape_graph(lca, params)
+            tape_graphs[lca] = graph
+        return lca
 
 
 def build_tape_graph(target: TapeState, params: ModelParams) -> TapeGraphArrays:
@@ -231,10 +254,14 @@ def integrate_branch(
 
 
 def leaf_likelihood(
-    leaf_tape: TapeState, branch_length: jnp.ndarray | float, params: ModelParams
+    leaf_tape: TapeState,
+    branch_length: jnp.ndarray | float,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
+    params: ModelParams,
 ) -> Tuple[TapeGraphArrays, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Initialize and integrate the likelihood vector for a labeled leaf."""
-    graph = build_tape_graph(leaf_tape, params)
+    graph: TapeGraphArrays = tape_graphs.get(leaf_tape)  # type: ignore
+
     d0 = jnp.zeros((len(graph.states),), dtype=jnp.float32)
     d0 = d0.at[graph.state_to_idx[leaf_tape]].set(1.0)
     return graph, integrate_branch(d0, graph, params, branch_length)
@@ -253,11 +280,12 @@ def combine_children(
     right_graph: TapeGraphArrays,
     right_values: jnp.ndarray,
     right_log_scale: jnp.ndarray,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
     params: ModelParams,
 ) -> Tuple[TapeGraphArrays, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Combine two child likelihood vectors into the parent pre-branch vector."""
     parent_tape = left_graph.target_tape.lca(right_graph.target_tape)
-    parent_graph = build_tape_graph(parent_tape, params)
+    parent_graph: TapeGraphArrays = tape_graphs.get(parent_tape)  # type: ignore
 
     def child_log(
         graph: TapeGraphArrays,
@@ -360,12 +388,15 @@ def rec_log_likelihood(
     node,
     branch_length: jnp.ndarray | float,
     params: ModelParams,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
     branch_lengths: Mapping[Tuple[Any, Any], jnp.ndarray | float] | None = None,
 ) -> Tuple[TapeGraphArrays, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Recursively compute the log-likelihood on a binary tree"""
     if tree.out_degree(node) == 0:
         # node is a leaf
-        return leaf_likelihood(tree.nodes[node]["label"], branch_length, params)
+        return leaf_likelihood(
+            tree.nodes[node]["label"], branch_length, tape_graphs, params
+        )
     else:
         # interior node
         children = list(tree.successors(node))
@@ -378,10 +409,10 @@ def rec_log_likelihood(
             left_length = branch_lengths[(node, left)]
             right_length = branch_lengths[(node, right)]
         (left_graph, (left_vals, left_scales)) = rec_log_likelihood(
-            tree, left, left_length, params, branch_lengths
+            tree, left, left_length, params, tape_graphs, branch_lengths
         )
         (right_graph, (right_vals, right_scales)) = rec_log_likelihood(
-            tree, right, right_length, params, branch_lengths
+            tree, right, right_length, params, tape_graphs, branch_lengths
         )
         parent_graph, (parent_values, parent_scale) = combine_children(
             left_graph,
@@ -390,8 +421,10 @@ def rec_log_likelihood(
             right_graph,
             right_vals,
             right_scales,
+            tape_graphs,
             params,
         )
+
         return propagate_likelihood(
             parent_graph, parent_values, parent_scale, branch_length, params
         )
@@ -401,6 +434,7 @@ def log_likelihood(
     tree: nx.DiGraph,
     params: ModelParams,
     root_length: jnp.ndarray | float,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
     branch_lengths: Mapping[Tuple[Any, Any], jnp.ndarray | float] | None = None,
 ) -> jnp.ndarray | float:
     """
@@ -415,9 +449,9 @@ def log_likelihood(
     assert len(root) == 1
     root = root[0]
     tree_graph, (tree_values, tree_log_scale) = rec_log_likelihood(
-        tree, root, root_length, params, branch_lengths
+        tree, root, root_length, params, tape_graphs, branch_lengths
     )
-    root_graph = build_tape_graph(tree_graph.target_tape, params)
+    root_graph: TapeGraphArrays = tape_graphs.get(tree_graph.target_tape)  # type: ignore
     root_values, root_log_scale = root_initial_frequencies(
         root_graph, root_length, params
     )
@@ -496,7 +530,11 @@ def constrained_model_params(
 
 
 def likelihood_from_raw_params(
-    tree: nx.DiGraph, raw_params: ArrayLikeTree, m: int, dt: float
+    tree: nx.DiGraph,
+    raw_params: ArrayLikeTree,
+    m: int,
+    dt: float,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
 ) -> jnp.ndarray | float:
     """Evaluate the tree log-likelihood from unconstrained trainable variables."""
     params, root_length, branch_lengths = constrained_model_params(raw_params, m, dt)
@@ -504,15 +542,20 @@ def likelihood_from_raw_params(
         tree,
         params,
         root_length,
+        tape_graphs,
         branch_lengths=branch_length_map(tree, branch_lengths),
     )
 
 
 def neg_log_likelihood_from_raw_params(
-    tree: nx.DiGraph, raw_params: ArrayLikeTree, m: int, dt: float
+    tree: nx.DiGraph,
+    raw_params: ArrayLikeTree,
+    m: int,
+    dt: float,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
 ) -> jnp.ndarray | float:
     """Convenience loss for optimizers that minimize objectives."""
-    logl = likelihood_from_raw_params(tree, raw_params, m, dt)
+    logl = likelihood_from_raw_params(tree, raw_params, m, dt, tape_graphs)
     return -logl
 
 
@@ -544,6 +587,7 @@ def init_raw_params(
 def optimize_likelihood(
     tree: nx.DiGraph,
     raw_params: ArrayLikeTree,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
     m: int,
     dt: float,
     learning_rate: float = 1e-2,
@@ -557,7 +601,9 @@ def optimize_likelihood(
     )
     opt_state = optimizer.init(raw_params)
 
-    loss_fn = lambda params: neg_log_likelihood_from_raw_params(tree, params, m, dt)
+    loss_fn = lambda params: neg_log_likelihood_from_raw_params(
+        tree, params, m, dt, tape_graphs
+    )
 
     @eqx.filter_jit
     def step_fn(params, state):
@@ -601,9 +647,12 @@ def diagnose_gradients(
     raw_params: ArrayLikeTree,
     m: int,
     dt: float,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
 ) -> tuple[float, ArrayLikeTree, dict[str, dict[str, float | bool]]]:
     """Compute one loss/gradient evaluation and summarize gradient pathologies."""
-    loss_fn = lambda params: neg_log_likelihood_from_raw_params(tree, params, m, dt)
+    loss_fn = lambda params: neg_log_likelihood_from_raw_params(
+        tree, params, m, dt, tape_graphs
+    )
     loss, grads = jax.value_and_grad(loss_fn)(raw_params)
     summary = summarize_gradient_tree(grads)
     return float(loss), grads, summary
@@ -635,13 +684,14 @@ def diagnose_objective_gradients(
 def gradient_ablation_diagnostics(
     tree: nx.DiGraph,
     raw_params: ArrayLikeTree,
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
     m: int,
     dt: float,
 ) -> dict[str, Any]:
     """Diagnose which likelihood block introduces bad gradients using stop-gradient cuts."""
 
     def full_loss(params):
-        return neg_log_likelihood_from_raw_params(tree, params, m, dt)
+        return neg_log_likelihood_from_raw_params(tree, params, m, dt, tape_graphs)
 
     def root_only_loss(params):
         model_params, root_length, branch_lengths = constrained_model_params(
@@ -652,6 +702,7 @@ def gradient_ablation_diagnostics(
             [v for v in tree.nodes if tree.in_degree(v) == 0][0],
             root_length,
             model_params,
+            tape_graphs,
             branch_length_map(tree, branch_lengths),
         )
         tree_values = jax.lax.stop_gradient(tree_values)
@@ -678,6 +729,7 @@ def gradient_ablation_diagnostics(
             [v for v in tree.nodes if tree.in_degree(v) == 0][0],
             root_length,
             model_params,
+            tape_graphs,
             branch_length_map(tree, branch_lengths),
         )
         root_graph = build_tape_graph(tree_graph.target_tape, model_params)
@@ -762,10 +814,15 @@ def test_autodif():
         lambd=1.0,
         root_length=1.5,
     )
+    params = constrained_model_params(raw, 3, 0.05)
+
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays] = {}
+    populate_tape_graphs(tree, 0, tape_graphs, params[0])
 
     raw_opt, history = optimize_likelihood(
         tree,
         raw,
+        tape_graphs,
         m=3,
         dt=0.05,
         learning_rate=1e-2,
@@ -786,7 +843,8 @@ def find_grad_issue():
         root_length=1.5,
     )
 
-    diag = gradient_ablation_diagnostics(tree, raw, m=3, dt=0.01)
+    tape_graphs = {}
+    diag = gradient_ablation_diagnostics(tree, raw, tape_graphs, m=3, dt=0.01)
     for name, result in diag.items():
         print(name)
         print(result["objective"])
