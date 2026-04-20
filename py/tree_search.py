@@ -8,6 +8,8 @@ from model import (
     optimize_likelihood,
     edge_order,
     populate_tape_graphs,
+    positive_inverse_transform,
+    positive_transform
 )
 import jax.numpy as jnp
 
@@ -82,19 +84,23 @@ def max_likelihood_tree_search(
                 [nT.get_edge_data(u, v)["weight"] for u, v in edge_order(nT)],
                 dtype=jnp.float32,
             )
-            params["branch_lengths"] = branch_lengths  # type: ignore
+            params["branch_lengths"] = positive_inverse_transform(branch_lengths)  # type: ignore
             this_likel = neg_log_likelihood_from_raw_params(
                 nT, params, m, dt, tape_graphs
             )
             print("nnis likelihood:", this_likel)
-            if this_likel < ml:
+            if this_likel < best_nni[1]:
                 best_nni = (nT, this_likel, params)
 
-        (T, _, params) = best_nni
+        (T, t_ml, params) = best_nni
+
+        if abs(ml - t_ml) < tol or steps == max_steps:
+            break
+
         # optimize at each iteration
         params, history = optimize_likelihood(
             T,
-            raw_params,
+            params,
             tape_graphs,
             m,
             dt,
@@ -102,17 +108,15 @@ def max_likelihood_tree_search(
             optimization_loop_steps,
             grad_clip_norm,
         )
-        t_ml = history[-1]
+        print(history, jnp.min(positive_transform(params["branch_lengths"])))
 
-        if abs(ml - t_ml) < tol or steps == max_steps:
-            break
-
-        ml = t_ml
+        ml = history[-1]
         steps += 1
 
     params, history = optimize_likelihood(
         T, params, tape_graphs, m, dt, learning_rate, final_steps, grad_clip_norm
     )
+    print(history, jnp.min(positive_transform(params["branch_lengths"])))
 
     return T, params, history[-1]
 
@@ -136,8 +140,8 @@ def build_test_tree() -> nx.DiGraph:
     ]
     labeling = [
         (7, TapeState((0, 1), (0,), 1)),
-        (8, TapeState((0, 1, 1), (0, 1), 1)),
-        (9, TapeState((1, 2), (1,), 1)),
+        (9, TapeState((0, 1, 1), (0, 1), 1)),
+        (8, TapeState((1, 2), (1,), 1)),
         (10, TapeState((1, 2), (1, 2), 0)),
         (11, TapeState((2, 1), (2,), 1)),
         (12, TapeState((2, 0), (2, 0), 0)),
