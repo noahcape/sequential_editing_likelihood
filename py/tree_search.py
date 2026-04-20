@@ -32,7 +32,7 @@ def nni_neighborhood(T: nx.DiGraph):
         vc_w = T.get_edge_data(u, b)["weight"]
         vd_w = T.get_edge_data(v, d)["weight"]
 
-        # First NNI: swap b and c
+        # First nni: swap b and c
         T1 = T.copy()
         T1.remove_edge(u, b)
         T1.remove_edge(v, c)
@@ -40,7 +40,7 @@ def nni_neighborhood(T: nx.DiGraph):
         T1.add_edge(v, b, weight=vc_w)
         nnis.append(T1)
 
-        # Second NNI: swap b and d
+        # Second nni: swap b and d
         T2 = T.copy()
         T2.remove_edge(u, b)
         T2.remove_edge(v, d)

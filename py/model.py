@@ -198,7 +198,6 @@ def d_ode(
 
     transfer_vals = gather_or_zero(d, graph.transfer_targets)
 
-    # TODO: this is not correct should allow for division away from the targets though only into unsampled term
     even_rhs = -(lambd + h) * d + edit_sum + 0.5 * lambd * u_at_t * divide_sum
     odd_rhs = (
         -(lambd + tau) * d + tau * transfer_vals + 0.5 * lambd * u_at_t * divide_sum
@@ -247,7 +246,7 @@ def integrate_branch(
         dt0=dt0,
         y0=d0,
         saveat=diffrax.SaveAt(t1=True),
-        stepsize_controller=diffrax.PIDController(rtol=1e-3, atol=1e-5),
+        stepsize_controller=diffrax.ConstantStepSize(),
         max_steps=100_000,
     )
     return normalize_likelihood(solution.ys[0])  # type: ignore
