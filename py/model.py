@@ -22,6 +22,7 @@ class ModelParams:
 
 
 ArrayLikeTree = Mapping[str, Any]
+LOG_ZERO = -1.0e30
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,7 @@ class TapeState:
                 )
 
         while leading:
-            if orientation == TapeState.EVEN:
+            if orientation == TapeState.EVEN and len(lagging) > 0:
                 preds.append(TapeState(tuple(leading), tuple(lagging), orientation))
                 lagging.pop()
                 orientation = TapeState.ODD
@@ -91,7 +92,7 @@ class TapeState:
                         TapeState(tuple(leading + [gamma]), tuple(lagging), orientation)
                     )
                 orientation = TapeState.EVEN
-
+                
         preds.append(TapeState.empty())
         return preds
 
@@ -112,12 +113,8 @@ def build_tape_graph(target: TapeState, params: ModelParams) -> TapeGraphArrays:
     """Build the predecessor-state graph for one target tape using padded arrays."""
     states = tuple(set(target.predecessors(params)))
     state_to_idx = {state: i for i, state in enumerate(states)}
-    n = len(states)
     n_eta = len(params.eta)
 
-    edit_targets = -jnp.ones((n, n_eta), dtype=jnp.int32)
-    transfer_targets = -jnp.ones((n,), dtype=jnp.int32)
-    divide_targets = -jnp.ones((n, 2), dtype=jnp.int32)
     orientation = jnp.array([state.orientation for state in states], dtype=jnp.int32)
 
     edit_rows = []
@@ -178,6 +175,7 @@ def d_ode(
 
     transfer_vals = gather_or_zero(d, graph.transfer_targets)
 
+    # TODO: this is not correct should allow for division away from the targets though only into unsampled term
     even_rhs = -(lambd + h) * d + edit_sum + 0.5 * lambd * u_at_t * divide_sum
     odd_rhs = (
         -(lambd + tau) * d + tau * transfer_vals + 0.5 * lambd * u_at_t * divide_sum
@@ -269,11 +267,11 @@ def combine_children(
     ):
         """Look up one parent state inside a child's graph and return its log-likelihood."""
         if parent_idx < 0:
-            return -jnp.inf
+            return jnp.asarray(LOG_ZERO)
         state = parent_graph.states[parent_idx]
         child_idx = graph.state_to_idx.get(state, -1)
         if child_idx < 0:
-            return -jnp.inf
+            return jnp.asarray(LOG_ZERO)
         return offset + log_value(values[child_idx])
 
     d_log = []
@@ -291,9 +289,22 @@ def combine_children(
         )
 
     d_log = jnp.array(d_log)
-    max_log = jnp.max(d_log)
-    d = jnp.where(jnp.isfinite(d_log), jnp.exp(d_log - max_log), 0.0)
+    d, max_log = normalize_log_values(d_log)
     return parent_graph, (d, max_log)
+
+
+def normalize_log_values(log_values: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Normalize log-values while handling the all-impossible case."""
+    max_log = jnp.max(log_values)
+    is_valid = jnp.isfinite(max_log)
+    safe_max_log = jnp.where(is_valid, max_log, 0.0)
+    values = jnp.where(
+        is_valid & jnp.isfinite(log_values),
+        jnp.exp(log_values - safe_max_log),
+        0.0,
+    )
+    log_scale = jnp.where(is_valid, max_log, 0.0)
+    return values, log_scale
 
 
 def propagate_likelihood(
@@ -563,6 +574,7 @@ def optimize_likelihood(
     state = opt_state
     for _ in range(steps):
         params, state, loss = step_fn(params, state)
+        # print("LOSS:", loss)
         history.append(float(loss))
 
     return params, history  # type: ignore
@@ -595,6 +607,124 @@ def diagnose_gradients(
     loss, grads = jax.value_and_grad(loss_fn)(raw_params)
     summary = summarize_gradient_tree(grads)
     return float(loss), grads, summary
+
+
+def _finite_scalar_summary(x: jnp.ndarray | float) -> dict[str, float | bool]:
+    """Summarize one scalar objective value."""
+    arr = jnp.asarray(x)
+    return {
+        "value": float(arr),
+        "is_finite": bool(jnp.isfinite(arr)),
+        "is_nan": bool(jnp.isnan(arr)),
+        "is_inf": bool(jnp.isinf(arr)),
+    }
+
+
+def diagnose_objective_gradients(
+    objective,
+    raw_params: ArrayLikeTree,
+) -> dict[str, Any]:
+    """Run value_and_grad on an objective and summarize the resulting gradients."""
+    value, grads = jax.value_and_grad(objective)(raw_params)
+    return {
+        "objective": _finite_scalar_summary(value),
+        "gradients": summarize_gradient_tree(grads),
+    }
+
+
+def gradient_ablation_diagnostics(
+    tree: nx.DiGraph,
+    raw_params: ArrayLikeTree,
+    m: int,
+    dt: float,
+) -> dict[str, Any]:
+    """Diagnose which likelihood block introduces bad gradients using stop-gradient cuts."""
+
+    def full_loss(params):
+        return neg_log_likelihood_from_raw_params(tree, params, m, dt)
+
+    def root_only_loss(params):
+        model_params, root_length, branch_lengths = constrained_model_params(
+            params, m, dt
+        )
+        tree_graph, (tree_values, tree_log_scale) = rec_log_likelihood(
+            tree,
+            [v for v in tree.nodes if tree.in_degree(v) == 0][0],
+            root_length,
+            model_params,
+            branch_length_map(tree, branch_lengths),
+        )
+        tree_values = jax.lax.stop_gradient(tree_values)
+        tree_log_scale = jax.lax.stop_gradient(tree_log_scale)
+        root_graph = build_tape_graph(tree_graph.target_tape, model_params)
+        root_values, root_log_scale = root_initial_frequencies(
+            root_graph, root_length, model_params
+        )
+        return -combine_with_root_frequencies(
+            tree_graph,
+            tree_values,
+            tree_log_scale,
+            root_graph,
+            root_values,
+            root_log_scale,
+        )
+
+    def tree_only_loss(params):
+        model_params, root_length, branch_lengths = constrained_model_params(
+            params, m, dt
+        )
+        tree_graph, (tree_values, tree_log_scale) = rec_log_likelihood(
+            tree,
+            [v for v in tree.nodes if tree.in_degree(v) == 0][0],
+            root_length,
+            model_params,
+            branch_length_map(tree, branch_lengths),
+        )
+        root_graph = build_tape_graph(tree_graph.target_tape, model_params)
+        root_values, root_log_scale = root_initial_frequencies(
+            root_graph, root_length, model_params
+        )
+        root_values = jax.lax.stop_gradient(root_values)
+        root_log_scale = jax.lax.stop_gradient(root_log_scale)
+        return -combine_with_root_frequencies(
+            tree_graph,
+            tree_values,
+            tree_log_scale,
+            root_graph,
+            root_values,
+            root_log_scale,
+        )
+
+    def branch_solve_only_loss(params):
+        model_params, root_length, branch_lengths = constrained_model_params(
+            params, m, dt
+        )
+        leaf = next(v for v in tree.nodes if tree.out_degree(v) == 0)
+        label = tree.nodes[leaf]["label"]
+        graph = build_tape_graph(label, model_params)
+        d0 = jnp.zeros((len(graph.states),), dtype=jnp.float32)
+        d0 = d0.at[graph.state_to_idx[label]].set(1.0)
+        values, log_scale = integrate_branch(
+            d0,
+            graph,
+            model_params,
+            branch_lengths[0] if branch_lengths.shape[0] else root_length,
+        )
+        return -(jnp.sum(values) + log_scale)
+
+    diagnostics = {
+        "full": diagnose_objective_gradients(full_loss, raw_params),
+        "root_only_tree_stopped": diagnose_objective_gradients(
+            root_only_loss, raw_params
+        ),
+        "tree_only_root_stopped": diagnose_objective_gradients(
+            tree_only_loss, raw_params
+        ),
+        "single_branch_solve": diagnose_objective_gradients(
+            branch_solve_only_loss, raw_params
+        ),
+    }
+    return diagnostics
 
 
 def build_test_tree() -> nx.DiGraph:
@@ -632,9 +762,6 @@ def test_autodif():
         lambd=1.0,
         root_length=1.5,
     )
-    loss, grads, summary = diagnose_gradients(tree, raw, m=3, dt=0.01)
-    print(loss)
-    print(summary)
 
     raw_opt, history = optimize_likelihood(
         tree,
@@ -648,5 +775,52 @@ def test_autodif():
     print(constrained_model_params(raw_opt, 3, 0.05))
 
 
+def find_grad_issue():
+    tree = build_test_tree()
+    raw = init_raw_params(
+        tree,
+        eta=[1.4, 1.8, 2.2],
+        rho=0.1,
+        tau=0.2,
+        lambd=1.0,
+        root_length=1.5,
+    )
+
+    diag = gradient_ablation_diagnostics(tree, raw, m=3, dt=0.01)
+    for name, result in diag.items():
+        print(name)
+        print(result["objective"])
+        print(result["gradients"])
+
+
+def test_state_graph():
+    tape = TapeState((1, 2), (1,), 1)
+    params = ModelParams(
+        rho=0.1,
+        eta=jnp.ones(3, dtype=float),
+        tau=0.2,
+        lambd=1.5,
+        m=3,
+        dt=0.5,
+    )
+    graph = build_tape_graph(tape, params)
+    print(params.eta)
+    print("divide targets", graph.divide_targets)
+    print("transfer targets", graph.transfer_targets)
+    print("edit targets", graph.edit_targets)
+    print("orientation", graph.orientation)
+    print("divide targets py", graph.divide_targets_py)
+    print("state to idx")
+    for s in graph.state_to_idx:
+        print(s, graph.state_to_idx[s])
+    print("states")
+    for s in graph.states:
+        print(s)
+    print("target tape", graph.target_tape)
+
+
 if __name__ == "__main__":
+    # test_state_graph()
+
     test_autodif()
+    # find_grad_issue()
