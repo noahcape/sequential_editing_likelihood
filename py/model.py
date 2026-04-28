@@ -571,6 +571,69 @@ def branch_length_map(
     return {edge: branch_lengths[i] for i, edge in enumerate(edges)}
 
 
+def internal_node_order(tree: nx.DiGraph) -> Tuple[Any, ...]:
+    """Return a stable order for internal nodes whose heights are optimized."""
+    return tuple(v for v in nx.topological_sort(tree) if tree.out_degree(v) > 0)
+
+
+def initial_height_increments(tree: nx.DiGraph) -> jnp.ndarray:
+    """Initialize ultrametric height increments from the current edge weights."""
+    heights = {}
+    increments = {}
+    for node in reversed(tuple(nx.topological_sort(tree))):
+        children = list(tree.successors(node))
+        if not children:
+            heights[node] = 0.0
+            continue
+
+        child_heights = [
+            heights[child] + float(tree.get_edge_data(node, child)["weight"])
+            for child in children
+        ]
+        node_height = max(child_heights)
+        max_child_height = max(heights[child] for child in children)
+        heights[node] = node_height
+        increments[node] = max(node_height - max_child_height, 1e-6)
+
+    return jnp.array(
+        [increments[node] for node in internal_node_order(tree)], dtype=jnp.float32
+    )
+
+
+def ultrametric_branch_lengths(
+    tree: nx.DiGraph, height_increments: jnp.ndarray
+) -> jnp.ndarray:
+    """Derive edge lengths from internal node heights, making all leaves depth-equal."""
+    nodes = internal_node_order(tree)
+    assert height_increments.shape[0] == len(nodes)
+    increment_by_node = {node: height_increments[i] for i, node in enumerate(nodes)}
+
+    heights = {}
+    for node in reversed(tuple(nx.topological_sort(tree))):
+        children = list(tree.successors(node))
+        if not children:
+            heights[node] = jnp.asarray(0.0, dtype=height_increments.dtype)
+            continue
+
+        child_heights = jnp.array([heights[child] for child in children])
+        heights[node] = jnp.max(child_heights) + increment_by_node[node]
+
+    return jnp.array([heights[u] - heights[v] for u, v in edge_order(tree)])
+
+
+def constrained_branch_lengths(tree: nx.DiGraph, raw_params: ArrayLikeTree) -> jnp.ndarray:
+    """Convert raw length parameters into the per-edge lengths used by the ODE."""
+    if "height_increments" in raw_params:
+        height_increments = positive_transform(
+            jnp.asarray(raw_params["height_increments"], dtype=jnp.float32)
+        )
+        return ultrametric_branch_lengths(tree, height_increments)
+
+    return positive_transform(
+        jnp.asarray(raw_params["branch_lengths"], dtype=jnp.float32)
+    )
+
+
 def positive_transform(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     """Map unconstrained reals to strictly positive values."""
     return jax.nn.softplus(x) + eps
@@ -598,7 +661,7 @@ def unit_interval_inverse_transform(x: jnp.ndarray, eps: float = 1e-6) -> jnp.nd
 def constrained_model_params(
     raw_params: ArrayLikeTree, m: int, dt: float
 ) -> Tuple[ModelParams, jnp.ndarray, jnp.ndarray]:
-    """Convert unconstrained optimization variables into model parameters and lengths."""
+    """Convert unconstrained optimization variables into model parameters."""
     rho = unit_interval_transform(jnp.asarray(raw_params["rho"], dtype=jnp.float32))
     eta = positive_transform(jnp.asarray(raw_params["eta"], dtype=jnp.float32))
     tau = positive_transform(jnp.asarray(raw_params["tau"], dtype=jnp.float32))
@@ -606,8 +669,10 @@ def constrained_model_params(
     root_length = positive_transform(
         jnp.asarray(raw_params["root_length"], dtype=jnp.float32)
     )
-    branch_lengths = positive_transform(
-        jnp.asarray(raw_params["branch_lengths"], dtype=jnp.float32)
+    branch_lengths = (
+        positive_transform(jnp.asarray(raw_params["branch_lengths"], dtype=jnp.float32))
+        if "branch_lengths" in raw_params
+        else jnp.array([], dtype=jnp.float32)
     )
 
     params = ModelParams(
@@ -629,7 +694,8 @@ def likelihood_from_raw_params(
     tape_graphs: MutableMapping[TapeState, TapeGraphArrays],
 ) -> jnp.ndarray | float:
     """Evaluate the tree log-likelihood from unconstrained trainable variables."""
-    params, root_length, branch_lengths = constrained_model_params(raw_params, m, dt)
+    params, root_length, _ = constrained_model_params(raw_params, m, dt)
+    branch_lengths = constrained_branch_lengths(tree, raw_params)
     branch_map = branch_length_map(tree, branch_lengths)
     return log_likelihood(
         tree,
@@ -661,10 +727,7 @@ def init_raw_params(
     root_length: float,
 ) -> dict[str, jnp.ndarray]:
     """Pack an initial guess into unconstrained variables for optimization."""
-    branch_lengths = jnp.array(
-        [tree.get_edge_data(u, v)["weight"] for u, v in edge_order(tree)],
-        dtype=jnp.float32,
-    )
+    height_increments = initial_height_increments(tree)
     return {
         "rho": unit_interval_inverse_transform(jnp.asarray(rho, dtype=jnp.float32)),
         "eta": positive_inverse_transform(jnp.asarray(eta, dtype=jnp.float32)),
@@ -673,7 +736,7 @@ def init_raw_params(
         "root_length": positive_inverse_transform(
             jnp.asarray(root_length, dtype=jnp.float32)
         ),
-        "branch_lengths": positive_inverse_transform(branch_lengths),
+        "height_increments": positive_inverse_transform(height_increments),
     }
 
 
@@ -787,9 +850,8 @@ def gradient_ablation_diagnostics(
         return neg_log_likelihood_from_raw_params(tree, params, m, dt, tape_graphs)
 
     def root_only_loss(params):
-        model_params, root_length, branch_lengths = constrained_model_params(
-            params, m, dt
-        )
+        model_params, root_length, _ = constrained_model_params(params, m, dt)
+        branch_lengths = constrained_branch_lengths(tree, params)
         tree_graph, (tree_values, tree_log_scale) = rec_log_likelihood(
             tree,
             [v for v in tree.nodes if tree.in_degree(v) == 0][0],
@@ -814,9 +876,8 @@ def gradient_ablation_diagnostics(
         )
 
     def tree_only_loss(params):
-        model_params, root_length, branch_lengths = constrained_model_params(
-            params, m, dt
-        )
+        model_params, root_length, _ = constrained_model_params(params, m, dt)
+        branch_lengths = constrained_branch_lengths(tree, params)
         tree_graph, (tree_values, tree_log_scale) = rec_log_likelihood(
             tree,
             [v for v in tree.nodes if tree.in_degree(v) == 0][0],
@@ -841,9 +902,8 @@ def gradient_ablation_diagnostics(
         )
 
     def branch_solve_only_loss(params):
-        model_params, root_length, branch_lengths = constrained_model_params(
-            params, m, dt
-        )
+        model_params, root_length, _ = constrained_model_params(params, m, dt)
+        branch_lengths = constrained_branch_lengths(tree, params)
         leaf = next(v for v in tree.nodes if tree.out_degree(v) == 0)
         label = tree.nodes[leaf]["label"]
         graph = build_tape_graph(label, model_params)

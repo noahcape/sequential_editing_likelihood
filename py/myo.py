@@ -2,7 +2,7 @@ import json
 from dataclasses import asdict, is_dataclass
 import csv
 import networkx as nx
-from typing import List
+from typing import List, Tuple
 from model import TapeState, ModelParams
 import pandas as pd
 import jax
@@ -31,7 +31,7 @@ def make_jsonable(x):
 
 def print_tree(T, path: str):
     with open(path, "w") as f:
-        f.write("source,target,weight\n")
+        f.write("parent,child,weight\n")
         for u, v, d in T.edges(data=True):
             w = d.get("weight", "")
             f.write(f"{u},{v},{w}\n")
@@ -61,7 +61,7 @@ def parse_tape(s: str) -> List[int]:
     return [int(x) for x in s.split(";") if x != ""]
 
 
-def load_tape_states(path: str) -> list[TapeState]:
+def load_tape_states(path: str) -> Tuple[list[TapeState], list[int]]:
     states = []
     leaves = []
 
@@ -81,7 +81,7 @@ def load_tape_states(path: str) -> list[TapeState]:
 
 
 def read_full_tree(path: str) -> nx.DiGraph:
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, dtype={"parent": int, "child": int})
     return nx.from_pandas_edgelist(
         df, "parent", "child", edge_attr=True, create_using=nx.DiGraph()
     )

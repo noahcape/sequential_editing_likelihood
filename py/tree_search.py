@@ -3,7 +3,9 @@ from model import (
     TapeState,
     ModelParams,
     constrained_model_params,
+    constrained_branch_lengths,
     init_raw_params,
+    initial_height_increments,
     neg_log_likelihood_from_raw_params,
     optimize_likelihood,
     edge_order,
@@ -89,7 +91,7 @@ def nni_neighborhood(T: nx.DiGraph, n=None):
 
 def sync_tree_branch_lengths(T: nx.DiGraph, raw_params, m: int, dt: float) -> None:
     """Copy optimized branch lengths from packed params back onto the tree edges."""
-    _, _, branch_lengths = constrained_model_params(raw_params, m, dt)
+    branch_lengths = constrained_branch_lengths(T, raw_params)
     edges = edge_order(T)
     assert branch_lengths.shape[0] == len(edges)
     for i, (u, v) in enumerate(edges):
@@ -133,13 +135,10 @@ def max_likelihood_tree_search(
 
         print("current best likelihood:", ml)
         for nT in nnis:
-            # set branch lengths in params
-            branch_lengths = jnp.array(
-                [nT.get_edge_data(u, v)["weight"] for u, v in edge_order(nT)],
-                dtype=jnp.float32,
-            )
+            # Reinitialize the ultrametric height variables for this topology.
+            height_increments = initial_height_increments(nT)
             candidate_params = dict(raw_params_iter)
-            candidate_params["branch_lengths"] = positive_inverse_transform(branch_lengths)  # type: ignore
+            candidate_params["height_increments"] = positive_inverse_transform(height_increments)  # type: ignore
             this_likel = neg_log_likelihood_from_raw_params(
                 nT, candidate_params, params_.m, params_.dt, tape_graphs
             )
@@ -170,6 +169,7 @@ def max_likelihood_tree_search(
         steps += 1
         step_likelihood.append(ml)
 
+    sync_tree_branch_lengths(T, raw_params_iter, params_.m, params_.dt)
     return T, raw_params_iter, step_likelihood, tape_graphs
 
 
@@ -233,6 +233,7 @@ def tree_search(
         final_steps,
         grad_clip_norm,
     )
+    sync_tree_branch_lengths(best_T, params, params_.m, params_.dt)
 
     return best_T, params, history[-1], best_ts_history + history
 

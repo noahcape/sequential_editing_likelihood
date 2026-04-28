@@ -2,13 +2,13 @@
 This file will test the convergence of the log-likelihood
 """
 
-from itertools import combinations
 import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
 from myo import load_tape_states, print_tree, params_to_json
 from model import (
     ModelParams,
+    constrained_branch_lengths,
     constrained_model_params,
     edge_order,
     ensure_fixed_tape_graphs,
@@ -17,17 +17,6 @@ from model import (
 )
 from tree_search import tree_search
 
-
-def tree_distance_map(T: nx.DiGraph, label_idx_map):
-    leaves = [u for u in T.nodes() if T.out_degree[u] == 0]
-    D = []
-    for u, v in combinations(leaves, 2):
-        shortest_path = nx.shortest_path_length(T, source=u, target=v)
-        i = label_idx_map[T[u]["label"]]
-        j = label_idx_map[T[v]["label"]]
-        D[i, j] = shortest_path
-
-    return D
 
 
 def plot_convergence_single(history, title, fname):
@@ -123,8 +112,8 @@ def config_best_tree(best_tree, edge_lengths, root_length):
     for i, (u, v) in enumerate(edge_ordering):
         best_tree[u][v]["weight"] = edge_lengths[i].item()
 
-    best_tree.add_node("dummy_root")
-    best_tree.add_edge("dummy_root", root, weight=root_length.item())
+    best_tree.add_node(-1)
+    best_tree.add_edge(-1, root, weight=root_length.item())
 
     return best_tree
 
@@ -155,7 +144,8 @@ if __name__ == "__main__":
         best_tree, best_params, ml, likelihood_history = tree_search_convergence(
             labels, leaves, params, 1e-2, 10, 500, 1e-10, 1.0, 10, root_length, nni_edges, 5
         )
-        params, root_length, edge_lengths = constrained_model_params(best_params, m, dt)
+        params, root_length, _ = constrained_model_params(best_params, m, dt)
+        edge_lengths = constrained_branch_lengths(best_tree, best_params)
 
         params_to_json(params, f"./simulations/{seed}/reconstructed_params.json")
 
