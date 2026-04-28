@@ -1,22 +1,45 @@
 import json
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 import csv
 import networkx as nx
 from typing import List
 from model import TapeState, ModelParams
 import pandas as pd
+import jax
+import numpy as np
+
+def make_jsonable(x):
+    if is_dataclass(x):
+        return make_jsonable(asdict(x))
+
+    if isinstance(x, (jax.Array, np.ndarray)):
+        if x.ndim == 0:
+            return x.item()      # scalar JAX/NumPy array -> Python scalar
+        return x.tolist()        # array -> list
+
+    if isinstance(x, np.generic):
+        return x.item()          # np.float32, np.int64, etc.
+
+    if isinstance(x, dict):
+        return {k: make_jsonable(v) for k, v in x.items()}
+
+    if isinstance(x, (list, tuple)):
+        return [make_jsonable(v) for v in x]
+
+    return x
 
 
 def print_tree(T, path: str):
     with open(path, "w") as f:
         f.write("source,target,weight\n")
-        nx.write_edgelist(T, path, ",")
+        for u, v, d in T.edges(data=True):
+            w = d.get("weight", "")
+            f.write(f"{u},{v},{w}\n")
     return T
 
 """Write params to json"""
 def params_to_json(params: ModelParams, path: str):
-    params_dict = asdict(params)
-    params_dict["eta"] = params_dict["eta"].tolist() 
+    params_dict = make_jsonable(params)
     
     with open(path, "w") as f:
         json.dump(params_dict, f)

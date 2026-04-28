@@ -66,6 +66,7 @@ def fixed_tree_convergence(
 
 def tree_search_convergence(
     labels,
+    leaves,
     params,
     learning_rate,
     inner_steps,
@@ -79,6 +80,7 @@ def tree_search_convergence(
 ):
     T, params, ml, history = tree_search(
         labels,
+        leaves,
         params,
         learning_rate,
         inner_steps,
@@ -131,7 +133,7 @@ if __name__ == "__main__":
         root_length = 5.0
 
         file = f"./simulations/{seed}/sampled_leaves.csv"
-        leaves, _ = load_tape_states(file)
+        labels, leaves = load_tape_states(file)
 
         # initialize params
         params = ModelParams(
@@ -141,17 +143,17 @@ if __name__ == "__main__":
         # tree search convergence
         print(params)
 
-        if len(leaves) > 25:
+        if len(labels) > 25:
             nni_edges = 15
         else:
             nni_edges = None
 
         best_tree, best_params, ml, likelihood_history = tree_search_convergence(
-            leaves, params, 1e-2, 10, 500, 1e-10, 1.0, 10, root_length, nni_edges, 1
+            labels, leaves, params, 1e-2, 10, 500, 1e-10, 1.0, 10, root_length, nni_edges, 5
         )
         params, root_length, edge_lengths = constrained_model_params(best_params, m, dt)
 
-        params_to_json(params, f"./simulations/{seed}/reconstructed_params.csv")
+        params_to_json(params, f"./simulations/{seed}/reconstructed_params.json")
 
         best_tree = config_best_tree(best_tree, edge_lengths, root_length)
         print_tree(best_tree, f"./simulations/{seed}/reconstructed_tree.csv")

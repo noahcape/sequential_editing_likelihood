@@ -14,18 +14,17 @@ from model import (
 import jax.numpy as jnp
 import random
 
-
-def random_tree(labels):
+def random_tree(labels, leaves):
     """
     Initialize a random tree with n leaves where n = len(labels)
     Initialize each each length to be 5.0
     """
     tree = nx.DiGraph()
-    for i, label in enumerate(labels):
+    for i, label in zip(leaves, labels):
         tree.add_node(i, label=label)
 
-    current_nodes = [i for i in range(len(labels))]
-    idx = len(labels)
+    current_nodes = leaves.copy()
+    idx = max(leaves) + 1
     # randomly sample two nodes and join them
     while len(current_nodes) > 1:
         a, b = random.sample(current_nodes, 2)
@@ -146,7 +145,7 @@ def max_likelihood_tree_search(
             optimization_loop_steps,
             grad_clip_norm,
         )
-        print(history, jnp.min(positive_transform(raw_params_iter["branch_lengths"])))
+        print(history)
 
         ml = history[-1]
         steps += 1
@@ -155,12 +154,13 @@ def max_likelihood_tree_search(
     return T, raw_params_iter, step_likelihood, tape_graphs
 
 
-def random_initial_trees(labels, n=10):
-    return [random_tree(labels) for _ in range(n)]
+def random_initial_trees(labels, leaves, n=10):
+    return [random_tree(labels, leaves) for _ in range(n)]
 
 
 def tree_search(
     labels,
+    leaves,
     params_: ModelParams,
     learning_rate,
     optimization_loop_steps,
@@ -172,7 +172,7 @@ def tree_search(
     max_steps=10,
     nni_edges=None
 ):
-    initial_random_trees = random_initial_trees(labels, n)
+    initial_random_trees = random_initial_trees(labels, leaves, n)
 
     best_ml = jnp.inf
     best_T = None
@@ -279,4 +279,4 @@ def test_tree_search():
 
 
 if __name__ == "__main__":
-    test_tree_search()
+    build_test_tree()
