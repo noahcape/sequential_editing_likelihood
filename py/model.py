@@ -43,6 +43,9 @@ class TapeState:
         orientation = TapeState.EVEN if len(leading) == len(lagging) else TapeState.ODD
         return TapeState(tuple(leading), tuple(lagging), orientation)
 
+    def as_string(self) -> str:
+        return ";".join(self.leading) + "," + ";".join(self.lagging)
+
     def edit(self, edit_idx: int) -> "TapeState":
         return TapeState(self.leading + (edit_idx,), self.lagging, TapeState.ODD)
 
@@ -537,12 +540,13 @@ def likelihood_from_raw_params(
 ) -> jnp.ndarray | float:
     """Evaluate the tree log-likelihood from unconstrained trainable variables."""
     params, root_length, branch_lengths = constrained_model_params(raw_params, m, dt)
+    branch_map = branch_length_map(tree, branch_lengths)
     return log_likelihood(
         tree,
         params,
         root_length,
         tape_graphs,
-        branch_lengths=branch_length_map(tree, branch_lengths),
+        branch_lengths=branch_map,
     )
 
 

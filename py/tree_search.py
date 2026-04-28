@@ -9,18 +9,49 @@ from model import (
     edge_order,
     populate_tape_graphs,
     positive_inverse_transform,
-    positive_transform
+    positive_transform,
 )
 import jax.numpy as jnp
+import random
+
+
+def random_tree(labels):
+    """
+    Initialize a random tree with n leaves where n = len(labels)
+    Initialize each each length to be 5.0
+    """
+    tree = nx.DiGraph()
+    for i, label in enumerate(labels):
+        tree.add_node(i, label=label)
+
+    current_nodes = [i for i in range(len(labels))]
+    idx = len(labels)
+    # randomly sample two nodes and join them
+    while len(current_nodes) > 1:
+        a, b = random.sample(current_nodes, 2)
+        current_nodes.remove(a)
+        current_nodes.remove(b)
+
+        tree.add_node(idx)
+        tree.add_edge(idx, a, weight=5.0)
+        tree.add_edge(idx, b, weight=5.0)
+        current_nodes.append(idx)
+        idx += 1
+
+    return tree
 
 
 def get_internal_edges(T: nx.DiGraph):
     return [(u, v) for (u, v) in T.edges() if T.degree[v] > 2 and T.degree[u] > 2]
 
 
-def nni_neighborhood(T: nx.DiGraph):
+def nni_neighborhood(T: nx.DiGraph, n=None):
     internal_edges = get_internal_edges(T)
     nnis = []
+    
+    # if n is set randomly sampled n internal edges to create nnis on
+    if n is not None:
+        internal_edges = random.sample(internal_edges, n)
 
     for u, v in internal_edges:
         # Neighbors on each side excluding the central edge
@@ -57,68 +88,134 @@ def max_likelihood_tree_search(
     T: nx.DiGraph,
     raw_params,
     params_: ModelParams,
-    m,
-    dt,
     learning_rate,
     optimization_loop_steps,
-    final_steps,
     grad_clip_norm,
     tol,
     max_steps=10,
+    nni_edges=None
 ):
     tape_graphs = {}
-    populate_tape_graphs(T, 0, tape_graphs, params_)
+    root = [v for v in T.nodes if T.in_degree[v] == 0]
+    assert len(root) == 1, "Must have unique root"
 
-    params = raw_params
-    ml = neg_log_likelihood_from_raw_params(T, params, m, dt, tape_graphs)
+    populate_tape_graphs(T, root[0], tape_graphs, params_)
+
+    raw_params_iter = raw_params
+    ml = neg_log_likelihood_from_raw_params(
+        T, raw_params_iter, params_.m, params_.dt, tape_graphs
+    )
+    step_likelihood = [ml]
 
     steps = 0
     while True:
-        best_nni = (T, ml, params)
+        best_nni = (T, ml, raw_params_iter)
 
         print("current best likelihood:", ml)
-        for nT in nni_neighborhood(T):
-            populate_tape_graphs(T, 0, tape_graphs, params_)
+        for nT in nni_neighborhood(T, n=nni_edges):
+            root = [v for v in nT.nodes if nT.in_degree[v] == 0]
+            assert len(root) == 1, "Must have unique root"
+            populate_tape_graphs(nT, root[0], tape_graphs, params_)
             # set branch lengths in params
             branch_lengths = jnp.array(
                 [nT.get_edge_data(u, v)["weight"] for u, v in edge_order(nT)],
                 dtype=jnp.float32,
             )
-            params["branch_lengths"] = positive_inverse_transform(branch_lengths)  # type: ignore
+            raw_params_iter["branch_lengths"] = positive_inverse_transform(branch_lengths)  # type: ignore
             this_likel = neg_log_likelihood_from_raw_params(
-                nT, params, m, dt, tape_graphs
+                nT, raw_params_iter, params_.m, params_.dt, tape_graphs
             )
             print("nnis likelihood:", this_likel)
             if this_likel < best_nni[1]:
-                best_nni = (nT, this_likel, params)
+                best_nni = (nT, this_likel, raw_params_iter)
 
-        (T, t_ml, params) = best_nni
+        (T, t_ml, raw_params_iter) = best_nni
 
+        # break condition
         if abs(ml - t_ml) < tol or steps == max_steps:
             break
 
         # optimize at each iteration
-        params, history = optimize_likelihood(
+        raw_params_iter, history = optimize_likelihood(
             T,
-            params,
+            raw_params_iter,
             tape_graphs,
-            m,
-            dt,
+            params_.m,
+            params_.dt,
             learning_rate,
             optimization_loop_steps,
             grad_clip_norm,
         )
-        print(history, jnp.min(positive_transform(params["branch_lengths"])))
+        print(history, jnp.min(positive_transform(raw_params_iter["branch_lengths"])))
 
         ml = history[-1]
         steps += 1
+        step_likelihood.append(ml)
+
+    return T, raw_params_iter, step_likelihood, tape_graphs
+
+
+def random_initial_trees(labels, n=10):
+    return [random_tree(labels) for _ in range(n)]
+
+
+def tree_search(
+    labels,
+    params_: ModelParams,
+    learning_rate,
+    optimization_loop_steps,
+    final_steps,
+    grad_clip_norm,
+    tol,
+    root_length,
+    n=10,
+    max_steps=10,
+    nni_edges=None
+):
+    initial_random_trees = random_initial_trees(labels, n)
+
+    best_ml = jnp.inf
+    best_T = None
+    best_params = None
+    best_ts_history = []
+    best_tape_graphs = {}
+
+    # do this in parallel
+    for init_t in initial_random_trees:
+        raw_params = init_raw_params(
+            init_t, params_.eta, params_.rho, params_.tau, params_.lambd, root_length
+        )
+        T, params, history, tape_graphs = max_likelihood_tree_search(
+            init_t,
+            raw_params,
+            params_,
+            learning_rate,
+            optimization_loop_steps,
+            grad_clip_norm,
+            tol,
+            max_steps,
+            nni_edges,
+        )
+        ml = history[-1]
+        if ml < best_ml:
+            best_ml = ml
+            best_T = T
+            best_params = params
+            best_ts_history = history
+            best_tape_graphs = tape_graphs
 
     params, history = optimize_likelihood(
-        T, params, tape_graphs, m, dt, learning_rate, final_steps, grad_clip_norm
+        best_T,
+        best_params,
+        best_tape_graphs,
+        params_.m,
+        params_.dt,
+        learning_rate,
+        final_steps,
+        grad_clip_norm,
     )
-    print(history, jnp.min(positive_transform(params["branch_lengths"])))
 
-    return T, params, history[-1]
+    return best_T, params, history[-1], best_ts_history + history
 
 
 def build_test_tree() -> nx.DiGraph:
@@ -173,7 +270,7 @@ def test_tree_search():
         0.1, jnp.asarray([0.1, 0.1, 0.1], dtype=float), 0.2, 1.0, 3, 0.5
     )
 
-    _, raw_opt, ml = max_likelihood_tree_search(
+    _, raw_opt, ml, _ = max_likelihood_tree_search(
         T, raw, params, 3, 0.5, 1e-2, 100, 1000, 1.0, 1e-5, 3
     )
 

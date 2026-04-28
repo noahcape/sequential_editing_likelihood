@@ -1,0 +1,21 @@
+{
+  "lambda": 1.0,
+  "tau": 0.15,
+  "eta": [
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1
+  ],
+  "birth_rate": 0.5,
+  "max_tape_len": 8,
+  "num_tapes": 1,
+  "symmetric": false,
+  "rho": 0.1
+}
