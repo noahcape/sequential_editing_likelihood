@@ -10,6 +10,8 @@ from myo import load_tape_states, print_tree, params_to_json
 from model import (
     ModelParams,
     constrained_model_params,
+    edge_order,
+    ensure_fixed_tape_graphs,
     optimize_likelihood,
     populate_tape_graphs,
 )
@@ -57,6 +59,7 @@ def fixed_tree_convergence(
     tape_graphs = {}
     root = [v for v in T.nodes if T.in_degree[v] == 0][0]
     populate_tape_graphs(T, root, tape_graphs, params)
+    ensure_fixed_tape_graphs(tape_graphs, params)
     params, history = optimize_likelihood(
         T, raw_params, tape_graphs, params.m, params.dt, learning_rate, steps, gcn
     )
@@ -116,7 +119,7 @@ def config_best_tree(best_tree, edge_lengths, root_length):
 
     root = [v for v in best_tree.nodes if best_tree.in_degree[v] == 0][0]
     # update the edge lengths in best_tree
-    edge_ordering = best_tree.edges()
+    edge_ordering = edge_order(best_tree)
     for i, (u, v) in enumerate(edge_ordering):
         best_tree[u][v]["weight"] = edge_lengths[i].item()
 
@@ -128,6 +131,7 @@ def config_best_tree(best_tree, edge_lengths, root_length):
 
 if __name__ == "__main__":
     for seed in range(10, 20):
+        print("Running on simulation:", seed)
         dt = 0.05
         m = 10
         root_length = 5.0

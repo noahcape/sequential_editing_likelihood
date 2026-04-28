@@ -8,8 +8,8 @@ from model import (
     optimize_likelihood,
     edge_order,
     populate_tape_graphs,
+    ensure_fixed_tape_graphs,
     positive_inverse_transform,
-    positive_transform,
 )
 import jax.numpy as jnp
 import random
@@ -41,7 +41,11 @@ def random_tree(labels, leaves):
 
 
 def get_internal_edges(T: nx.DiGraph):
-    return [(u, v) for (u, v) in T.edges() if T.degree[v] > 2 and T.degree[u] > 2]
+    return [
+        (u, v)
+        for (u, v) in T.edges()
+        if T.out_degree[u] == 2 and T.out_degree[v] == 2
+    ]
 
 
 def nni_neighborhood(T: nx.DiGraph, n=None):
@@ -54,14 +58,14 @@ def nni_neighborhood(T: nx.DiGraph, n=None):
 
     for u, v in internal_edges:
         # Neighbors on each side excluding the central edge
-        u_side = [x for x in T.neighbors(u) if x != v]
-        v_side = [x for x in T.neighbors(v) if x != u]
+        u_side = [x for x in T.successors(u) if x != v]
+        v_side = list(T.successors(v))
 
         b = u_side[0]
         c, d = v_side
 
         ub_w = T.get_edge_data(u, b)["weight"]
-        vc_w = T.get_edge_data(u, b)["weight"]
+        vc_w = T.get_edge_data(v, c)["weight"]
         vd_w = T.get_edge_data(v, d)["weight"]
 
         # First nni: swap b and c
@@ -83,6 +87,15 @@ def nni_neighborhood(T: nx.DiGraph, n=None):
     return nnis
 
 
+def sync_tree_branch_lengths(T: nx.DiGraph, raw_params, m: int, dt: float) -> None:
+    """Copy optimized branch lengths from packed params back onto the tree edges."""
+    _, _, branch_lengths = constrained_model_params(raw_params, m, dt)
+    edges = edge_order(T)
+    assert branch_lengths.shape[0] == len(edges)
+    for i, (u, v) in enumerate(edges):
+        T[u][v]["weight"] = float(branch_lengths[i])
+
+
 def max_likelihood_tree_search(
     T: nx.DiGraph,
     raw_params,
@@ -99,6 +112,7 @@ def max_likelihood_tree_search(
     assert len(root) == 1, "Must have unique root"
 
     populate_tape_graphs(T, root[0], tape_graphs, params_)
+    ensure_fixed_tape_graphs(tape_graphs, params_)
 
     raw_params_iter = raw_params
     ml = neg_log_likelihood_from_raw_params(
@@ -108,25 +122,30 @@ def max_likelihood_tree_search(
 
     steps = 0
     while True:
-        best_nni = (T, ml, raw_params_iter)
-
-        print("current best likelihood:", ml)
-        for nT in nni_neighborhood(T, n=nni_edges):
+        sync_tree_branch_lengths(T, raw_params_iter, params_.m, params_.dt)
+        best_nni = (T, ml, dict(raw_params_iter))
+        nnis = nni_neighborhood(T, n=nni_edges)
+        for nT in nnis:
             root = [v for v in nT.nodes if nT.in_degree[v] == 0]
             assert len(root) == 1, "Must have unique root"
             populate_tape_graphs(nT, root[0], tape_graphs, params_)
+        ensure_fixed_tape_graphs(tape_graphs, params_)
+
+        print("current best likelihood:", ml)
+        for nT in nnis:
             # set branch lengths in params
             branch_lengths = jnp.array(
                 [nT.get_edge_data(u, v)["weight"] for u, v in edge_order(nT)],
                 dtype=jnp.float32,
             )
-            raw_params_iter["branch_lengths"] = positive_inverse_transform(branch_lengths)  # type: ignore
+            candidate_params = dict(raw_params_iter)
+            candidate_params["branch_lengths"] = positive_inverse_transform(branch_lengths)  # type: ignore
             this_likel = neg_log_likelihood_from_raw_params(
-                nT, raw_params_iter, params_.m, params_.dt, tape_graphs
+                nT, candidate_params, params_.m, params_.dt, tape_graphs
             )
             print("nnis likelihood:", this_likel)
             if this_likel < best_nni[1]:
-                best_nni = (nT, this_likel, raw_params_iter)
+                best_nni = (nT, this_likel, candidate_params)
 
         (T, t_ml, raw_params_iter) = best_nni
 

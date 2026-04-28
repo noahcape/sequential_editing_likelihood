@@ -106,10 +106,15 @@ class TapeGraphArrays:
     states: Tuple[TapeState, ...]
     state_to_idx: Mapping[TapeState, int]
     divide_targets_py: Tuple[Tuple[int, int], ...]
+    active_mask_py: Tuple[bool, ...]
+    active_mask: jnp.ndarray
     orientation: jnp.ndarray
     edit_targets: jnp.ndarray
     transfer_targets: jnp.ndarray
     divide_targets: jnp.ndarray
+
+
+_FIXED_GRAPH_META_KEY = object()
 
 
 def populate_tape_graphs(
@@ -123,6 +128,7 @@ def populate_tape_graphs(
         if not tape_graphs.__contains__(tape):
             graph = build_tape_graph(T.nodes[node]["label"], params)
             tape_graphs[tape] = graph
+            tape_graphs.pop(_FIXED_GRAPH_META_KEY, None)  # type: ignore
         return tape
     else:
         a, b = T.neighbors(node)
@@ -132,7 +138,12 @@ def populate_tape_graphs(
         if not tape_graphs.__contains__(lca):
             graph = build_tape_graph(lca, params)
             tape_graphs[lca] = graph
+            tape_graphs.pop(_FIXED_GRAPH_META_KEY, None)  # type: ignore
         return lca
+
+
+def _state_sort_key(state: TapeState) -> Tuple[Tuple[int, ...], Tuple[int, ...], int]:
+    return state.leading, state.lagging, state.orientation
 
 
 def build_tape_graph(target: TapeState, params: ModelParams) -> TapeGraphArrays:
@@ -162,11 +173,74 @@ def build_tape_graph(target: TapeState, params: ModelParams) -> TapeGraphArrays:
         states=states,
         state_to_idx=state_to_idx,
         divide_targets_py=tuple(tuple(row) for row in divide_rows),
+        active_mask_py=tuple(True for _ in states),
+        active_mask=jnp.ones((len(states),), dtype=bool),
         orientation=orientation,
         edit_targets=jnp.array(edit_rows, dtype=jnp.int32),
         transfer_targets=jnp.array(transfer_rows, dtype=jnp.int32),
         divide_targets=jnp.array(divide_rows, dtype=jnp.int32),
     )
+
+
+def ensure_fixed_tape_graphs(
+    tape_graphs: MutableMapping[TapeState, TapeGraphArrays], params: ModelParams
+) -> None:
+    """Rewrite cached target graphs as fixed-size views over one global state space."""
+    targets = tuple(key for key in tape_graphs.keys() if isinstance(key, TapeState))
+    meta = tape_graphs.get(_FIXED_GRAPH_META_KEY)  # type: ignore
+    expected_meta = (targets, params.m, len(params.eta))
+    if meta == expected_meta:
+        return
+
+    all_states_set: set[TapeState] = set()
+    active_states_by_target: dict[TapeState, set[TapeState]] = {}
+    for target in targets:
+        active_states = set(target.predecessors(params))
+        active_states_by_target[target] = active_states
+        all_states_set.update(active_states)
+
+    states = tuple(sorted(all_states_set, key=_state_sort_key))
+    state_to_idx = {state: i for i, state in enumerate(states)}
+    n_eta = len(params.eta)
+
+    orientation = jnp.array([state.orientation for state in states], dtype=jnp.int32)
+    edit_rows = []
+    transfer_rows = []
+    divide_rows = []
+    for state in states:
+        edit_rows.append(
+            [state_to_idx.get(state.edit(edit_idx), -1) for edit_idx in range(n_eta)]
+        )
+        if state.orientation == TapeState.ODD and state.leading:
+            transfer_rows.append(state_to_idx.get(state.transfer(), -1))
+        else:
+            transfer_rows.append(-1)
+        left, right = state.divide()
+        divide_rows.append([state_to_idx.get(left, -1), state_to_idx.get(right, -1)])
+
+    divide_targets_py = tuple(tuple(row) for row in divide_rows)
+    edit_targets = jnp.array(edit_rows, dtype=jnp.int32)
+    transfer_targets = jnp.array(transfer_rows, dtype=jnp.int32)
+    divide_targets = jnp.array(divide_rows, dtype=jnp.int32)
+
+    for target in targets:
+        active_states = active_states_by_target[target]
+        active_mask_py = tuple(state in active_states for state in states)
+        active_mask = jnp.array(active_mask_py, dtype=bool)
+        tape_graphs[target] = TapeGraphArrays(
+            target_tape=target,
+            states=states,
+            state_to_idx=state_to_idx,
+            divide_targets_py=divide_targets_py,
+            active_mask_py=active_mask_py,
+            active_mask=active_mask,
+            orientation=orientation,
+            edit_targets=edit_targets,
+            transfer_targets=transfer_targets,
+            divide_targets=divide_targets,
+        )
+
+    tape_graphs[_FIXED_GRAPH_META_KEY] = expected_meta  # type: ignore
 
 
 def u_analytic(lambd: float, rho: float, t: jnp.ndarray) -> jnp.ndarray:
@@ -192,20 +266,24 @@ def d_ode(
 ) -> jnp.ndarray:
     """Evaluate the likelihood ODE over all states in one tape graph."""
     h = jnp.sum(eta)
+    active_d = jnp.where(graph.active_mask, d, 0.0)
 
-    divide_vals = gather_or_zero(d, graph.divide_targets)
+    divide_vals = gather_or_zero(active_d, graph.divide_targets)
     divide_sum = jnp.sum(divide_vals, axis=1)
 
-    edit_vals = gather_or_zero(d, graph.edit_targets)
+    edit_vals = gather_or_zero(active_d, graph.edit_targets)
     edit_sum = jnp.sum(edit_vals * eta[None, :], axis=1)
 
-    transfer_vals = gather_or_zero(d, graph.transfer_targets)
+    transfer_vals = gather_or_zero(active_d, graph.transfer_targets)
 
-    even_rhs = -(lambd + h) * d + edit_sum + 0.5 * lambd * u_at_t * divide_sum
+    even_rhs = -(lambd + h) * active_d + edit_sum + 0.5 * lambd * u_at_t * divide_sum
     odd_rhs = (
-        -(lambd + tau) * d + tau * transfer_vals + 0.5 * lambd * u_at_t * divide_sum
+        -(lambd + tau) * active_d
+        + tau * transfer_vals
+        + 0.5 * lambd * u_at_t * divide_sum
     )
-    return jnp.where(graph.orientation == TapeState.EVEN, even_rhs, odd_rhs)
+    rhs = jnp.where(graph.orientation == TapeState.EVEN, even_rhs, odd_rhs)
+    return jnp.where(graph.active_mask, rhs, 0.0)
 
 
 def normalize_likelihood(d: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -262,6 +340,7 @@ def leaf_likelihood(
     params: ModelParams,
 ) -> Tuple[TapeGraphArrays, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Initialize and integrate the likelihood vector for a labeled leaf."""
+    ensure_fixed_tape_graphs(tape_graphs, params)
     graph: TapeGraphArrays = tape_graphs.get(leaf_tape)  # type: ignore
 
     d0 = jnp.zeros((len(graph.states),), dtype=jnp.float32)
@@ -287,26 +366,31 @@ def combine_children(
 ) -> Tuple[TapeGraphArrays, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Combine two child likelihood vectors into the parent pre-branch vector."""
     parent_tape = left_graph.target_tape.lca(right_graph.target_tape)
+    ensure_fixed_tape_graphs(tape_graphs, params)
     parent_graph: TapeGraphArrays = tape_graphs.get(parent_tape)  # type: ignore
 
     def child_log(
         graph: TapeGraphArrays,
         values: jnp.ndarray,
         offset: jnp.ndarray,
-        parent_idx: int,
+        state_idx: int,
     ):
         """Look up one parent state inside a child's graph and return its log-likelihood."""
-        if parent_idx < 0:
+        if state_idx < 0:
             return jnp.asarray(LOG_ZERO)
-        state = parent_graph.states[parent_idx]
-        child_idx = graph.state_to_idx.get(state, -1)
-        if child_idx < 0:
+        if (
+            not parent_graph.active_mask_py[state_idx]
+            or not graph.active_mask_py[state_idx]
+        ):
             return jnp.asarray(LOG_ZERO)
-        return offset + log_value(values[child_idx])
+        return offset + log_value(values[state_idx])
 
     d_log = []
     branch_factor = jnp.log(0.5 * params.lambd)
-    for left_idx, right_idx in parent_graph.divide_targets_py:
+    for parent_idx, (left_idx, right_idx) in enumerate(parent_graph.divide_targets_py):
+        if not parent_graph.active_mask_py[parent_idx]:
+            d_log.append(jnp.asarray(LOG_ZERO))
+            continue
 
         term1 = child_log(
             left_graph, left_values, left_log_scale, left_idx
@@ -373,7 +457,11 @@ def combine_with_root_frequencies(
     root_log_sum = -jnp.inf
     for idx, state in enumerate(tree_graph.states):
         root_idx = root_graph.state_to_idx.get(state, -1)
-        if root_idx < 0:
+        if (
+            root_idx < 0
+            or not tree_graph.active_mask_py[idx]
+            or not root_graph.active_mask_py[root_idx]
+        ):
             continue
         term = (
             tree_log_scale
@@ -450,6 +538,8 @@ def log_likelihood(
     root = [v for v in tree.nodes if tree.in_degree(v) == 0]
     assert len(root) == 1
     root = root[0]
+    populate_tape_graphs(tree, root, tape_graphs, params)
+    ensure_fixed_tape_graphs(tape_graphs, params)
     tree_graph, (tree_values, tree_log_scale) = rec_log_likelihood(
         tree, root, root_length, params, tape_graphs, branch_lengths
     )
