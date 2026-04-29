@@ -23,6 +23,7 @@ class ModelParams:
 
 ArrayLikeTree = Mapping[str, Any]
 LOG_ZERO = -1.0e30
+MAX_STATES = 4096
 
 
 @dataclass(frozen=True)
@@ -146,39 +147,93 @@ def _state_sort_key(state: TapeState) -> Tuple[Tuple[int, ...], Tuple[int, ...],
     return state.leading, state.lagging, state.orientation
 
 
+def _validate_state_capacity(states: Sequence[TapeState]) -> None:
+    if len(states) > MAX_STATES:
+        raise ValueError(
+            f"tape graph has {len(states)} states, exceeding MAX_STATES={MAX_STATES}"
+        )
+
+
+def _padded_graph_arrays(
+    states: Tuple[TapeState, ...],
+    state_to_idx: Mapping[TapeState, int],
+    n_eta: int,
+    active_states: set[TapeState],
+) -> Tuple[
+    Tuple[Tuple[int, int], ...],
+    Tuple[bool, ...],
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+    """Build fixed-shape transition arrays for Diffrax/JAX-facing ODE solves."""
+    _validate_state_capacity(states)
+
+    orientation_rows = [TapeState.EVEN] * MAX_STATES
+    edit_rows = [[-1] * n_eta for _ in range(MAX_STATES)]
+    transfer_rows = [-1] * MAX_STATES
+    divide_rows = [[-1, -1] for _ in range(MAX_STATES)]
+    active_mask_py = [False] * MAX_STATES
+
+    for idx, state in enumerate(states):
+        orientation_rows[idx] = state.orientation
+        edit_rows[idx] = [
+            state_to_idx.get(state.edit(edit_idx), -1) for edit_idx in range(n_eta)
+        ]
+        if state.orientation == TapeState.ODD and state.leading:
+            transfer_rows[idx] = state_to_idx.get(state.transfer(), -1)
+
+        left, right = state.divide()
+        divide_rows[idx] = [state_to_idx.get(left, -1), state_to_idx.get(right, -1)]
+        active_mask_py[idx] = state in active_states
+
+    active_mask_py_tuple = tuple(active_mask_py)
+    divide_targets_py = tuple(tuple(row) for row in divide_rows)
+    active_mask = jnp.array(active_mask_py_tuple, dtype=bool)
+    orientation = jnp.array(orientation_rows, dtype=jnp.int32)
+    edit_targets = jnp.array(edit_rows, dtype=jnp.int32)
+    transfer_targets = jnp.array(transfer_rows, dtype=jnp.int32)
+    divide_targets = jnp.array(divide_rows, dtype=jnp.int32)
+    return (
+        divide_targets_py,
+        active_mask_py_tuple,
+        active_mask,
+        orientation,
+        edit_targets,
+        transfer_targets,
+        divide_targets,
+    )
+
+
 def build_tape_graph(target: TapeState, params: ModelParams) -> TapeGraphArrays:
     """Build the predecessor-state graph for one target tape using padded arrays."""
-    states = tuple(set(target.predecessors(params)))
+    states = tuple(sorted(set(target.predecessors(params)), key=_state_sort_key))
     state_to_idx = {state: i for i, state in enumerate(states)}
     n_eta = len(params.eta)
 
-    orientation = jnp.array([state.orientation for state in states], dtype=jnp.int32)
-
-    edit_rows = []
-    transfer_rows = []
-    divide_rows = []
-    for state in states:
-        edit_rows.append(
-            [state_to_idx.get(state.edit(edit_idx), -1) for edit_idx in range(n_eta)]
-        )
-        if state.orientation == TapeState.ODD and state.leading:
-            transfer_rows.append(state_to_idx.get(state.transfer(), -1))
-        else:
-            transfer_rows.append(-1)
-        left, right = state.divide()
-        divide_rows.append([state_to_idx.get(left, -1), state_to_idx.get(right, -1)])
+    (
+        divide_targets_py,
+        active_mask_py,
+        active_mask,
+        orientation,
+        edit_targets,
+        transfer_targets,
+        divide_targets,
+    ) = _padded_graph_arrays(states, state_to_idx, n_eta, set(states))
 
     return TapeGraphArrays(
         target_tape=target,
         states=states,
         state_to_idx=state_to_idx,
-        divide_targets_py=tuple(tuple(row) for row in divide_rows),
-        active_mask_py=tuple(True for _ in states),
-        active_mask=jnp.ones((len(states),), dtype=bool),
+        divide_targets_py=divide_targets_py,
+        active_mask_py=active_mask_py,
+        active_mask=active_mask,
         orientation=orientation,
-        edit_targets=jnp.array(edit_rows, dtype=jnp.int32),
-        transfer_targets=jnp.array(transfer_rows, dtype=jnp.int32),
-        divide_targets=jnp.array(divide_rows, dtype=jnp.int32),
+        edit_targets=edit_targets,
+        transfer_targets=transfer_targets,
+        divide_targets=divide_targets,
     )
 
 
@@ -203,30 +258,17 @@ def ensure_fixed_tape_graphs(
     state_to_idx = {state: i for i, state in enumerate(states)}
     n_eta = len(params.eta)
 
-    orientation = jnp.array([state.orientation for state in states], dtype=jnp.int32)
-    edit_rows = []
-    transfer_rows = []
-    divide_rows = []
-    for state in states:
-        edit_rows.append(
-            [state_to_idx.get(state.edit(edit_idx), -1) for edit_idx in range(n_eta)]
-        )
-        if state.orientation == TapeState.ODD and state.leading:
-            transfer_rows.append(state_to_idx.get(state.transfer(), -1))
-        else:
-            transfer_rows.append(-1)
-        left, right = state.divide()
-        divide_rows.append([state_to_idx.get(left, -1), state_to_idx.get(right, -1)])
-
-    divide_targets_py = tuple(tuple(row) for row in divide_rows)
-    edit_targets = jnp.array(edit_rows, dtype=jnp.int32)
-    transfer_targets = jnp.array(transfer_rows, dtype=jnp.int32)
-    divide_targets = jnp.array(divide_rows, dtype=jnp.int32)
-
     for target in targets:
         active_states = active_states_by_target[target]
-        active_mask_py = tuple(state in active_states for state in states)
-        active_mask = jnp.array(active_mask_py, dtype=bool)
+        (
+            divide_targets_py,
+            active_mask_py,
+            active_mask,
+            orientation,
+            edit_targets,
+            transfer_targets,
+            divide_targets,
+        ) = _padded_graph_arrays(states, state_to_idx, n_eta, active_states)
         tape_graphs[target] = TapeGraphArrays(
             target_tape=target,
             states=states,
@@ -265,16 +307,43 @@ def d_ode(
     u_at_t: jnp.ndarray,
 ) -> jnp.ndarray:
     """Evaluate the likelihood ODE over all states in one tape graph."""
-    h = jnp.sum(eta)
-    active_d = jnp.where(graph.active_mask, d, 0.0)
+    return d_ode_arrays(
+        d,
+        graph.active_mask,
+        graph.orientation,
+        graph.edit_targets,
+        graph.transfer_targets,
+        graph.divide_targets,
+        eta,
+        tau,
+        lambd,
+        u_at_t,
+    )
 
-    divide_vals = gather_or_zero(active_d, graph.divide_targets)
+
+def d_ode_arrays(
+    d: jnp.ndarray,
+    active_mask: jnp.ndarray,
+    orientation: jnp.ndarray,
+    edit_targets: jnp.ndarray,
+    transfer_targets: jnp.ndarray,
+    divide_targets: jnp.ndarray,
+    eta: jnp.ndarray,
+    tau: jnp.ndarray | float,
+    lambd: jnp.ndarray | float,
+    u_at_t: jnp.ndarray,
+) -> jnp.ndarray:
+    """Evaluate the likelihood ODE from fixed-shape JAX arrays only."""
+    h = jnp.sum(eta)
+    active_d = jnp.where(active_mask, d, 0.0)
+
+    divide_vals = gather_or_zero(active_d, divide_targets)
     divide_sum = jnp.sum(divide_vals, axis=1)
 
-    edit_vals = gather_or_zero(active_d, graph.edit_targets)
+    edit_vals = gather_or_zero(active_d, edit_targets)
     edit_sum = jnp.sum(edit_vals * eta[None, :], axis=1)
 
-    transfer_vals = gather_or_zero(active_d, graph.transfer_targets)
+    transfer_vals = gather_or_zero(active_d, transfer_targets)
 
     even_rhs = -(lambd + h) * active_d + edit_sum + 0.5 * lambd * u_at_t * divide_sum
     odd_rhs = (
@@ -282,8 +351,88 @@ def d_ode(
         + tau * transfer_vals
         + 0.5 * lambd * u_at_t * divide_sum
     )
-    rhs = jnp.where(graph.orientation == TapeState.EVEN, even_rhs, odd_rhs)
-    return jnp.where(graph.active_mask, rhs, 0.0)
+    rhs = jnp.where(orientation == TapeState.EVEN, even_rhs, odd_rhs)
+    return jnp.where(active_mask, rhs, 0.0)
+
+
+def vf(t, y, args):
+    (
+        active_mask,
+        orientation,
+        edit_targets,
+        transfer_targets,
+        divide_targets,
+        eta,
+        tau,
+        lambd,
+        rho,
+    ) = args
+    return d_ode_arrays(
+        y,
+        active_mask,
+        orientation,
+        edit_targets,
+        transfer_targets,
+        divide_targets,
+        eta,
+        tau,
+        lambd,
+        u_analytic(lambd, rho, t),
+    )
+
+
+TERM = diffrax.ODETerm(vf)
+SOLVER = diffrax.Midpoint()
+ADJOINT = diffrax.RecursiveCheckpointAdjoint()
+SAVE_AT_T1 = diffrax.SaveAt(t1=True)
+STEPSIZE_CONTROLLER = diffrax.ConstantStepSize()
+
+
+@jax.jit
+def solve_branch_arrays(
+    d0: jnp.ndarray,
+    active_mask: jnp.ndarray,
+    orientation: jnp.ndarray,
+    edit_targets: jnp.ndarray,
+    transfer_targets: jnp.ndarray,
+    divide_targets: jnp.ndarray,
+    eta: jnp.ndarray,
+    tau: jnp.ndarray,
+    lambd: jnp.ndarray,
+    rho: jnp.ndarray,
+    branch_length: jnp.ndarray,
+    dt: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """JIT boundary for Diffrax branch solves with stable array-only signatures."""
+    branch_length = jnp.asarray(branch_length, dtype=d0.dtype)
+    dt = jnp.asarray(dt, dtype=d0.dtype)
+    dt0 = jnp.maximum(jnp.minimum(dt, branch_length), 1e-6)
+    args = (
+        active_mask,
+        orientation,
+        edit_targets,
+        transfer_targets,
+        divide_targets,
+        eta,
+        tau,
+        lambd,
+        rho,
+    )
+
+    solution = diffrax.diffeqsolve(
+        TERM,
+        solver=SOLVER,
+        adjoint=ADJOINT,
+        t0=0.0,
+        t1=branch_length,
+        dt0=dt0,
+        y0=d0,
+        args=args,
+        saveat=SAVE_AT_T1,
+        stepsize_controller=STEPSIZE_CONTROLLER,
+        max_steps=100_000,
+    )
+    return normalize_likelihood(solution.ys[0])  # type: ignore
 
 
 def normalize_likelihood(d: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -303,34 +452,24 @@ def integrate_branch(
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Integrate one branch with Diffrax and return the normalized endpoint state."""
     eta = jnp.asarray(params.eta, dtype=d0.dtype)
-    branch_length = jnp.asarray(branch_length, dtype=d0.dtype)
-    dt0 = jnp.maximum(
-        jnp.minimum(jnp.asarray(params.dt, dtype=d0.dtype), branch_length), 1e-6
+    tau = jnp.asarray(params.tau, dtype=d0.dtype)
+    lambd = jnp.asarray(params.lambd, dtype=d0.dtype)
+    rho = jnp.asarray(params.rho, dtype=d0.dtype)
+    dt = jnp.asarray(params.dt, dtype=d0.dtype)
+    return solve_branch_arrays(
+        d0,
+        graph.active_mask,
+        graph.orientation,
+        graph.edit_targets,
+        graph.transfer_targets,
+        graph.divide_targets,
+        eta,
+        tau,
+        lambd,
+        rho,
+        jnp.asarray(branch_length, dtype=d0.dtype),
+        dt,
     )
-
-    def vf(t, y, _args):
-        return d_ode(
-            y,
-            graph,
-            eta,
-            params.tau,
-            params.lambd,
-            u_analytic(params.lambd, params.rho, t),
-        )
-
-    solution = diffrax.diffeqsolve(
-        diffrax.ODETerm(vf),
-        solver=diffrax.Midpoint(),
-        adjoint=diffrax.RecursiveCheckpointAdjoint(),
-        t0=0.0,
-        t1=branch_length,
-        dt0=dt0,
-        y0=d0,
-        saveat=diffrax.SaveAt(t1=True),
-        stepsize_controller=diffrax.ConstantStepSize(),
-        max_steps=100_000,
-    )
-    return normalize_likelihood(solution.ys[0])  # type: ignore
 
 
 def leaf_likelihood(
@@ -343,7 +482,7 @@ def leaf_likelihood(
     ensure_fixed_tape_graphs(tape_graphs, params)
     graph: TapeGraphArrays = tape_graphs.get(leaf_tape)  # type: ignore
 
-    d0 = jnp.zeros((len(graph.states),), dtype=jnp.float32)
+    d0 = jnp.zeros((MAX_STATES,), dtype=jnp.float32)
     d0 = d0.at[graph.state_to_idx[leaf_tape]].set(1.0)
     return graph, integrate_branch(d0, graph, params, branch_length)
 
@@ -440,7 +579,7 @@ def root_initial_frequencies(
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Integrate the root-start distribution from the empty tape along the root branch."""
     empty_idx = graph.state_to_idx[TapeState.empty()]
-    d0 = jnp.zeros((len(graph.states),), dtype=jnp.float32)
+    d0 = jnp.zeros((MAX_STATES,), dtype=jnp.float32)
     d0 = d0.at[empty_idx].set(1.0)
     return integrate_branch(d0, graph, params, root_length)
 
@@ -907,7 +1046,7 @@ def gradient_ablation_diagnostics(
         leaf = next(v for v in tree.nodes if tree.out_degree(v) == 0)
         label = tree.nodes[leaf]["label"]
         graph = build_tape_graph(label, model_params)
-        d0 = jnp.zeros((len(graph.states),), dtype=jnp.float32)
+        d0 = jnp.zeros((MAX_STATES,), dtype=jnp.float32)
         d0 = d0.at[graph.state_to_idx[label]].set(1.0)
         values, log_scale = integrate_branch(
             d0,

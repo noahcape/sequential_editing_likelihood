@@ -119,7 +119,7 @@ def config_best_tree(best_tree, edge_lengths, root_length):
 
 
 if __name__ == "__main__":
-    for seed in range(10, 20):
+    for seed in range(21, 22):
         print("Running on simulation:", seed)
         dt = 0.05
         m = 10
@@ -142,7 +142,7 @@ if __name__ == "__main__":
             nni_edges = None
 
         best_tree, best_params, ml, likelihood_history = tree_search_convergence(
-            labels, leaves, params, 1e-2, 10, 500, 1e-10, 1.0, 10, root_length, nni_edges, 5
+            labels, leaves, params, 1e-2, 10, 500, 1e-10, 1.0, 10, root_length, nni_edges, 10
         )
         params, root_length, _ = constrained_model_params(best_params, m, dt)
         edge_lengths = constrained_branch_lengths(best_tree, best_params)

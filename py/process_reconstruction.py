@@ -75,8 +75,8 @@ if __name__ == "__main__":
     recon_D, leaf_idx_map = process_reconstructed_tree(reconstruted_tree)
     true_D, states, leaves = process_underlying_tree(true_tree, sampled_leaves, leaf_idx_map)
 
-    plot_distances(scale_distances(recon_D), f"./simulations/{seed}/reconstructed_distances.png")
-    plot_distances(scale_distances(true_D), f"./simulations/{seed}/true_distances.png")
+    plot_distances(recon_D, f"./simulations/{seed}/reconstructed_distances.png")
+    plot_distances(true_D, f"./simulations/{seed}/true_distances.png")
     
     err = np.linalg.norm(recon_D - true_D) / np.linalg.norm(true_D)
     print(err)
