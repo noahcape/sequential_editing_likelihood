@@ -2,7 +2,7 @@
 
 This is the repository of the final project for APC 523 of Noah Cape. The project is title: *Reconstructing Phylogenies using DNA Typewriter Data*.
 
-**IMPORTANT** Before submitting either .slurm files to the cluster make sure to run:
+**IMPORTANT** Before submitting either executable below make sure to run:
 
 ```
 source ./setup_env.sh
