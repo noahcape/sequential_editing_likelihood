@@ -81,7 +81,7 @@ def load_tape_states(path: str) -> Tuple[list[TapeState], list[int]]:
 
 
 def read_full_tree(path: str) -> nx.DiGraph:
-    df = pd.read_csv(path, dtype={"parent": int, "child": int})
+    df = pd.read_csv(path, dtype={"parent": str, "child": str})
     return nx.from_pandas_edgelist(
         df, "parent", "child", edge_attr=True, create_using=nx.DiGraph()
     )

@@ -1,0 +1,30 @@
+{
+  "lambda": 1,
+  "tau": 0.15,
+  "eta": [
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1
+  ],
+  "birth_rate": 0.5,
+  "tree_shape": 2,
+  "tree_rate": 0.5,
+  "t_max": 20,
+  "root_length": 5.53332464582657,
+  "leaf_count": 81,
+  "max_tape_len": 8,
+  "num_tapes": 1,
+  "symmetric": false,
+  "rho": 0.25,
+  "dt": 0.05,
+  "tree_seed": 0,
+  "edit_seed": 11400714819323198485,
+  "sample_seed": 15111065706836454659
+}

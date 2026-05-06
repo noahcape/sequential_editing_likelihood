@@ -1,20 +1,87 @@
+import itertools
+from scipy.cluster.hierarchy import linkage, to_tree
+from scipy.spatial.distance import squareform
 import networkx as nx
 from model import (
     TapeState,
     ModelParams,
-    constrained_model_params,
-    constrained_branch_lengths,
-    init_raw_params,
     initial_height_increments,
-    neg_log_likelihood_from_raw_params,
-    optimize_likelihood,
-    edge_order,
-    populate_tape_graphs,
-    ensure_fixed_tape_graphs,
     positive_inverse_transform,
+)
+from n_model import (
+    array_neg_log_likelihood_from_raw_params,
+    constrain_array_raw_params,
+    encode_tree,
+    init_array_raw_params,
+    initial_height_increments_by_pos,
+    optimize_array_likelihood,
 )
 import jax.numpy as jnp
 import random
+from itertools import combinations
+import numpy as np
+from myo import params_to_json, print_tree
+
+def tape_distances(labels, leaves):
+    leaves = list(leaves)
+    labels = list(labels)
+
+    n = len(leaves)
+    D = np.zeros((n, n), dtype=float)
+
+    for a, b in combinations(range(n), 2):
+        distance = TapeState.distance(labels[a], labels[b])
+        D[a, b] = distance
+        D[b, a] = distance
+
+    return D
+
+def init_tree(labels, leaves, temp=0.0, rng=None, idx_map=None):
+    leaves = list(leaves)
+    labels = list(labels)
+    label_by_leaf = dict(zip(leaves, labels))
+
+    D = np.asarray(tape_distances(labels, leaves), dtype=float)
+
+    condensed = squareform(D, checks=False)
+    if temp is not None and temp > 0.0:
+        rng = np.random.default_rng() if rng is None else rng
+        condensed = np.maximum(
+            condensed + rng.gumbel(loc=0.0, scale=temp, size=condensed.shape),
+            0.0,
+        )
+
+    Z = linkage(condensed, method="average")
+    root_cluster = to_tree(Z)
+
+    reverse_map = {i: leaf for i, leaf in enumerate(leaves)}
+
+    T = nx.DiGraph()
+    next_internal = itertools.count(len(leaves))
+
+    def add_node(cluster):
+        if cluster.is_leaf():
+            leaf = reverse_map[cluster.id]
+            T.add_node(leaf, label=label_by_leaf[leaf])
+            return leaf
+
+        u = f"internal_{next(next_internal)}"
+        T.add_node(u)
+
+        left = add_node(cluster.left)
+        right = add_node(cluster.right)
+
+        left_len = max(cluster.dist - cluster.left.dist, 0.0)
+        right_len = max(cluster.dist - cluster.right.dist, 0.0)
+
+        T.add_edge(u, left, weight=left_len)
+        T.add_edge(u, right, weight=right_len)
+
+        return u
+
+    root = add_node(root_cluster)
+    T.graph["root"] = root
+    return T
 
 def random_tree(labels, leaves):
     """
@@ -44,16 +111,18 @@ def random_tree(labels, leaves):
 
 def get_internal_edges(T: nx.DiGraph):
     return [
-        (u, v)
-        for (u, v) in T.edges()
-        if T.out_degree[u] == 2 and T.out_degree[v] == 2
+        (u, v) for (u, v) in T.edges() if T.out_degree[u] == 2 and T.out_degree[v] == 2
     ]
+
+
+def is_internal(T, u, v):
+    return T.out_degree[u] == 2 and T.out_degree[v] == 2
 
 
 def nni_neighborhood(T: nx.DiGraph, n=None):
     internal_edges = get_internal_edges(T)
     nnis = []
-    
+
     # if n is set randomly sampled n internal edges to create nnis on
     if n is not None:
         internal_edges = random.sample(internal_edges, n)
@@ -86,16 +155,82 @@ def nni_neighborhood(T: nx.DiGraph, n=None):
         T2.add_edge(v, b, weight=vd_w)
         nnis.append(T2)
 
+    to_apply_nnis = min(10, int(0.5 * len(internal_edges)))
+    applied_nnis = 0
+    mixed_T = T.copy()
+    # now modify the original tree with max(10, 1/2 internal edges) nnis
+    while applied_nnis < to_apply_nnis:
+        u,v = random.sample(list(mixed_T.edges()), 1)[0]
+        if is_internal(mixed_T, u, v):
+            u_side = [x for x in mixed_T.successors(u) if x != v]
+            v_side = list(mixed_T.successors(v))
+
+            b = u_side[0]
+            c, d = v_side
+
+            ub_w = mixed_T.get_edge_data(u, b)["weight"]
+            vc_w = mixed_T.get_edge_data(v, c)["weight"]
+
+            mixed_T.remove_edge(u, b)
+            mixed_T.remove_edge(v, c)
+            mixed_T.add_edge(u, c, weight=ub_w)
+            mixed_T.add_edge(v, b, weight=vc_w)
+
+            applied_nnis += 1
+        else:
+            continue
+
+    nnis.append(mixed_T)
     return nnis
 
 
 def sync_tree_branch_lengths(T: nx.DiGraph, raw_params, m: int, dt: float) -> None:
     """Copy optimized branch lengths from packed params back onto the tree edges."""
-    branch_lengths = constrained_branch_lengths(T, raw_params)
-    edges = edge_order(T)
-    assert branch_lengths.shape[0] == len(edges)
-    for i, (u, v) in enumerate(edges):
-        T[u][v]["weight"] = float(branch_lengths[i])
+    encoded = encode_tree(T, ModelParams(0.1, raw_params["eta"], 1.0, 1.0, m, dt))
+    _, _, branch_lengths = constrain_array_raw_params(encoded, raw_params, dt, m)
+    for pos, node in enumerate(encoded.postorder_nodes):
+        parent_pos = int(encoded.parent[pos])
+        if parent_pos >= 0:
+            parent = encoded.postorder_nodes[parent_pos]
+            T[parent][node]["weight"] = float(branch_lengths[pos])
+
+
+def reinitialize_array_topology_params(encoded, raw_params):
+    """Keep model rates/root length and reinitialize heights for this topology."""
+    candidate_params = dict(raw_params)
+    candidate_params["height_increments_by_pos"] = positive_inverse_transform(
+        initial_height_increments_by_pos(encoded)
+    )
+    return candidate_params
+
+
+def array_raw_to_model_raw(tree: nx.DiGraph, raw_params, params_: ModelParams):
+    """Convert array optimizer params back to the legacy raw-parameter layout."""
+    sync_tree_branch_lengths(tree, raw_params, params_.m, params_.dt)
+    return {
+        "rho": raw_params["rho"],
+        "eta": raw_params["eta"],
+        "tau": raw_params["tau"],
+        "lambd": raw_params["lambd"],
+        "root_length": raw_params["root_length"],
+        "height_increments": positive_inverse_transform(initial_height_increments(tree)),
+    }
+
+
+def tree_with_root_edge(
+    tree: nx.DiGraph, raw_params, params_: ModelParams
+) -> nx.DiGraph:
+    """Return a copy of tree with optimized lengths and the external root edge."""
+    rooted_tree = tree.copy()
+    sync_tree_branch_lengths(rooted_tree, raw_params, params_.m, params_.dt)
+    encoded = encode_tree(rooted_tree, params_)
+    _, root_length, _ = constrain_array_raw_params(
+        encoded, raw_params, params_.dt, params_.m
+    )
+    root = [v for v in rooted_tree.nodes if rooted_tree.in_degree[v] == 0][0]
+    rooted_tree.add_node(-1)
+    rooted_tree.add_edge(-1, root, weight=root_length.item())
+    return rooted_tree
 
 
 def max_likelihood_tree_search(
@@ -107,57 +242,79 @@ def max_likelihood_tree_search(
     grad_clip_norm,
     tol,
     max_steps=10,
-    nni_edges=None
+    nni_edges=None,
+    screen_top_k=5,
+    candidate_polish_steps=5,
+    jit_optimizations=False,
 ):
-    tape_graphs = {}
     root = [v for v in T.nodes if T.in_degree[v] == 0]
     assert len(root) == 1, "Must have unique root"
 
-    populate_tape_graphs(T, root[0], tape_graphs, params_)
-    ensure_fixed_tape_graphs(tape_graphs, params_)
-
     raw_params_iter = raw_params
-    ml = neg_log_likelihood_from_raw_params(
-        T, raw_params_iter, params_.m, params_.dt, tape_graphs
+    encoded = encode_tree(T, params_)
+    ml = array_neg_log_likelihood_from_raw_params(
+        encoded, raw_params_iter, params_.dt
     )
     step_likelihood = [ml]
 
     steps = 0
-    while True:
+    while steps < max_steps:
         sync_tree_branch_lengths(T, raw_params_iter, params_.m, params_.dt)
-        best_nni = (T, ml, dict(raw_params_iter))
         nnis = nni_neighborhood(T, n=nni_edges)
-        for nT in nnis:
-            root = [v for v in nT.nodes if nT.in_degree[v] == 0]
-            assert len(root) == 1, "Must have unique root"
-            populate_tape_graphs(nT, root[0], tape_graphs, params_)
-        ensure_fixed_tape_graphs(tape_graphs, params_)
 
         print("current best likelihood:", ml)
+        scored_nnis = []
         for nT in nnis:
             # Reinitialize the ultrametric height variables for this topology.
-            height_increments = initial_height_increments(nT)
-            candidate_params = dict(raw_params_iter)
-            candidate_params["height_increments"] = positive_inverse_transform(height_increments)  # type: ignore
-            this_likel = neg_log_likelihood_from_raw_params(
-                nT, candidate_params, params_.m, params_.dt, tape_graphs
+            candidate_encoded = encode_tree(nT, params_)
+            candidate_params = reinitialize_array_topology_params(
+                candidate_encoded, raw_params_iter
+            )
+            this_likel = array_neg_log_likelihood_from_raw_params(
+                candidate_encoded, candidate_params, params_.dt
             )
             print("nnis likelihood:", this_likel)
-            if this_likel < best_nni[1]:
-                best_nni = (nT, this_likel, candidate_params)
+            scored_nnis.append(
+                (float(this_likel), nT, candidate_encoded, candidate_params)
+            )
+
+        scored_nnis.sort(key=lambda x: x[0])
+        shortlist = scored_nnis[: min(screen_top_k, len(scored_nnis))]
+        best_nni = (T, ml, dict(raw_params_iter))
+
+        for cheap_likel, nT, candidate_encoded, candidate_params in shortlist:
+            if candidate_polish_steps > 0:
+                polished_params, polish_history = optimize_array_likelihood(
+                    candidate_encoded,
+                    candidate_params,
+                    params_.dt,
+                    learning_rate,
+                    candidate_polish_steps,
+                    grad_clip_norm,
+                )
+                polished_likel = array_neg_log_likelihood_from_raw_params(
+                    candidate_encoded, polished_params, params_.dt
+                )
+            else:
+                polished_params = candidate_params
+                polished_likel = cheap_likel
+
+            print("polished nni likelihood:", polished_likel)
+            if polished_likel < best_nni[1]:
+                best_nni = (nT, polished_likel, polished_params)
 
         (T, t_ml, raw_params_iter) = best_nni
 
         # break condition
-        if abs(ml - t_ml) < tol or steps == max_steps:
+        # add a simulated annealing step here weighted by the gain multiplied by the temp
+        if abs(ml - t_ml) < tol:
             break
 
         # optimize at each iteration
-        raw_params_iter, history = optimize_likelihood(
-            T,
+        encoded = encode_tree(T, params_)
+        raw_params_iter, history = optimize_array_likelihood(
+            encoded,
             raw_params_iter,
-            tape_graphs,
-            params_.m,
             params_.dt,
             learning_rate,
             optimization_loop_steps,
@@ -165,19 +322,34 @@ def max_likelihood_tree_search(
         )
         print(history)
 
-        ml = history[-1]
+        ml = array_neg_log_likelihood_from_raw_params(encoded, raw_params_iter, params_.dt)
         steps += 1
         step_likelihood.append(ml)
 
     sync_tree_branch_lengths(T, raw_params_iter, params_.m, params_.dt)
-    return T, raw_params_iter, step_likelihood, tape_graphs
+    return T, raw_params_iter, step_likelihood, None
 
 
-def random_initial_trees(labels, leaves, n=10):
-    return [random_tree(labels, leaves) for _ in range(n)]
+def temp_perturbed_agglom_initial_trees(
+    labels,
+    leaves,
+    n=10,
+    include_agglomerative=True,
+    agglomerative_temperature=0.5,
+):
+    if not include_agglomerative:
+        return [random_tree(labels, leaves) for _ in range(n)]
+
+    rng = np.random.default_rng()
+    trees = [init_tree(labels, leaves, temp=0.0, rng=rng)]
+    trees.extend(
+        init_tree(labels, leaves, temp=agglomerative_temperature, rng=rng)
+        for _ in range(max(n - 1, 0))
+    )
+    return trees
 
 
-def tree_search(
+def tree_search_(
     labels,
     leaves,
     params_: ModelParams,
@@ -189,22 +361,34 @@ def tree_search(
     root_length,
     n=10,
     max_steps=10,
-    nni_edges=None
+    nni_edges=None,
+    screen_top_k=5,
+    candidate_polish_steps=5,
+    include_agglomerative=True,
+    agglomerative_temperature=0.5,
+    jit_optimizations=False,
+    name="",
 ):
-    initial_random_trees = random_initial_trees(labels, leaves, n)
-
+    initial_random_trees = temp_perturbed_agglom_initial_trees(
+        labels, leaves, n, include_agglomerative, agglomerative_temperature
+    )
     best_ml = jnp.inf
     best_T = None
     best_params = None
     best_ts_history = []
-    best_tape_graphs = {}
 
     # do this in parallel
     for init_t in initial_random_trees:
-        raw_params = init_raw_params(
-            init_t, params_.eta, params_.rho, params_.tau, params_.lambd, root_length
+        init_encoded = encode_tree(init_t, params_)
+        raw_params = init_array_raw_params(
+            init_encoded,
+            params_.eta,
+            params_.rho,
+            params_.tau,
+            params_.lambd,
+            root_length,
         )
-        T, params, history, tape_graphs = max_likelihood_tree_search(
+        T, params, history, _ = max_likelihood_tree_search(
             init_t,
             raw_params,
             params_,
@@ -214,6 +398,9 @@ def tree_search(
             tol,
             max_steps,
             nni_edges,
+            screen_top_k,
+            candidate_polish_steps,
+            jit_optimizations,
         )
         ml = history[-1]
         if ml < best_ml:
@@ -221,21 +408,34 @@ def tree_search(
             best_T = T
             best_params = params
             best_ts_history = history
-            best_tape_graphs = tape_graphs
 
-    params, history = optimize_likelihood(
-        best_T,
+            # temp write best likelihood tree
+            best_encoded = encode_tree(best_T, params_)
+            model_params, _, _ = constrain_array_raw_params(
+                best_encoded, best_params, params_.dt, params_.m
+            )
+
+            params_to_json(model_params, f"./{name}_so_far_reconstructed_params.json")
+
+            best_tree = tree_with_root_edge(best_T, best_params, params_)
+            print_tree(best_tree, f".{name}_so_far_reconstructed_tree.csv")
+
+    best_encoded = encode_tree(best_T, params_)
+    params, history = optimize_array_likelihood(
+        best_encoded,
         best_params,
-        best_tape_graphs,
-        params_.m,
         params_.dt,
         learning_rate,
         final_steps,
         grad_clip_norm,
     )
     sync_tree_branch_lengths(best_T, params, params_.m, params_.dt)
+    legacy_params = array_raw_to_model_raw(best_T, params, params_)
+    final_ml = array_neg_log_likelihood_from_raw_params(
+        encode_tree(best_T, params_), params, params_.dt
+    )
 
-    return best_T, params, history[-1], best_ts_history + history
+    return best_T, legacy_params, final_ml, best_ts_history + history + [final_ml]
 
 
 def build_test_tree() -> nx.DiGraph:
@@ -277,25 +477,32 @@ def build_test_tree() -> nx.DiGraph:
 
 def test_tree_search():
     T = build_test_tree()
-
-    raw = init_raw_params(
-        T,
-        eta=[0.1, 0.1, 0.1],
-        rho=0.1,
-        tau=0.2,
-        lambd=1.0,
-        root_length=1.5,
-    )
     params = ModelParams(
         0.1, jnp.asarray([0.1, 0.1, 0.1], dtype=float), 0.2, 1.0, 3, 0.5
     )
+    raw = init_array_raw_params(
+        encode_tree(T, params),
+        eta=params.eta,
+        rho=params.rho,
+        tau=params.tau,
+        lambd=params.lambd,
+        root_length=1.5,
+    )
 
     _, raw_opt, ml, _ = max_likelihood_tree_search(
-        T, raw, params, 3, 0.5, 1e-2, 100, 1000, 1.0, 1e-5, 3
+        T,
+        raw,
+        params,
+        learning_rate=1e-2,
+        optimization_loop_steps=1,
+        grad_clip_norm=1.0,
+        tol=1e-5,
+        max_steps=1,
+        nni_edges=1,
     )
 
     print(ml)
-    print(constrained_model_params(raw_opt, 3, 0.5))
+    print(raw_opt)
 
 
 if __name__ == "__main__":

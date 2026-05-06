@@ -2,3 +2,4 @@
 /sims
 .vscode
 /py/__pycache__
+.DS_Store

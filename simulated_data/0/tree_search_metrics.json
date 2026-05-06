@@ -1,0 +1,14 @@
+{
+  "error": null,
+  "final_neg_log_likelihood": 826.2049560546875,
+  "instance": "0",
+  "output_dir": "simulated_data/0",
+  "peak_rss_bytes": 4854284288,
+  "peak_rss_delta_bytes": 4607295488,
+  "peak_rss_delta_mb": 4393.859375,
+  "peak_rss_mb": 4629.40625,
+  "process_cpu_seconds": 72479.24829999999,
+  "sampled_leaves": 70,
+  "status": "ok",
+  "wall_seconds": 47512.102468792
+}

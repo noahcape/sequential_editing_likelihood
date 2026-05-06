@@ -23,7 +23,8 @@ class ModelParams:
 
 ArrayLikeTree = Mapping[str, Any]
 LOG_ZERO = -1.0e30
-MAX_STATES = 4096
+# todo: change
+MAX_STATES = 2048
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,22 @@ class TapeState:
     def edit(self, edit_idx: int) -> "TapeState":
         return TapeState(self.leading + (edit_idx,), self.lagging, TapeState.ODD)
 
+    def undo_edit(self) -> "TapeState" | None:
+        if self.orientation == TapeState.ODD:
+            return (
+                TapeState(self.leading[:-2], self.lagging, TapeState.EVEN),
+                self.leading[-1],
+            )
+        return None
+
+    def undo_transfer(self) -> "TapeState" | None:
+        if self.orientation == TapeState.EVEN:
+            return (
+                TapeState(self.leading, self.lagging[:-2], TapeState.EVEN),
+                self.lagging[-1],
+            )
+        return None
+
     def transfer(self) -> "TapeState":
         return TapeState.new(self.leading, self.lagging + (self.leading[-1],))
 
@@ -71,6 +88,25 @@ class TapeState:
                 break
             lag.append(a)
         return TapeState.new(lead, lag)
+
+    def distance(self, other: "TapeState") -> int:
+        lca_ = self.lca(other)
+        return (
+            len(self.leading)
+            - len(lca_.leading)
+            + len(self.lagging)
+            - len(lca_.lagging)
+            + len(other.leading)
+            - len(lca_.leading)
+            + len(other.lagging)
+            - len(lca_.lagging)
+        )
+
+    def lca_many(tapes: list["TapeState"]) -> "TapeState":
+        lca_ = tapes[0]
+        for next in tapes[1:]:
+            lca_ = lca_.lca(next)
+        return lca_
 
     def predecessors(self, params: ModelParams) -> List["TapeState"]:
         preds: List[TapeState] = []
@@ -106,6 +142,8 @@ class TapeGraphArrays:
     target_tape: TapeState
     states: Tuple[TapeState, ...]
     state_to_idx: Mapping[TapeState, int]
+    edit_targets_py: Tuple[Tuple[int, ...], ...]
+    transfer_targets_py: Tuple[int, ...]
     divide_targets_py: Tuple[Tuple[int, int], ...]
     active_mask_py: Tuple[bool, ...]
     active_mask: jnp.ndarray
@@ -160,6 +198,8 @@ def _padded_graph_arrays(
     n_eta: int,
     active_states: set[TapeState],
 ) -> Tuple[
+    Tuple[Tuple[int, ...], ...],
+    Tuple[int, ...],
     Tuple[Tuple[int, int], ...],
     Tuple[bool, ...],
     jnp.ndarray,
@@ -190,6 +230,8 @@ def _padded_graph_arrays(
         active_mask_py[idx] = state in active_states
 
     active_mask_py_tuple = tuple(active_mask_py)
+    edit_targets_py = tuple(tuple(row) for row in edit_rows)
+    transfer_targets_py = tuple(transfer_rows)
     divide_targets_py = tuple(tuple(row) for row in divide_rows)
     active_mask = jnp.array(active_mask_py_tuple, dtype=bool)
     orientation = jnp.array(orientation_rows, dtype=jnp.int32)
@@ -197,6 +239,8 @@ def _padded_graph_arrays(
     transfer_targets = jnp.array(transfer_rows, dtype=jnp.int32)
     divide_targets = jnp.array(divide_rows, dtype=jnp.int32)
     return (
+        edit_targets_py,
+        transfer_targets_py,
         divide_targets_py,
         active_mask_py_tuple,
         active_mask,
@@ -214,6 +258,8 @@ def build_tape_graph(target: TapeState, params: ModelParams) -> TapeGraphArrays:
     n_eta = len(params.eta)
 
     (
+        edit_targets_py,
+        transfer_targets_py,
         divide_targets_py,
         active_mask_py,
         active_mask,
@@ -227,6 +273,8 @@ def build_tape_graph(target: TapeState, params: ModelParams) -> TapeGraphArrays:
         target_tape=target,
         states=states,
         state_to_idx=state_to_idx,
+        edit_targets_py=edit_targets_py,
+        transfer_targets_py=transfer_targets_py,
         divide_targets_py=divide_targets_py,
         active_mask_py=active_mask_py,
         active_mask=active_mask,
@@ -261,6 +309,8 @@ def ensure_fixed_tape_graphs(
     for target in targets:
         active_states = active_states_by_target[target]
         (
+            edit_targets_py,
+            transfer_targets_py,
             divide_targets_py,
             active_mask_py,
             active_mask,
@@ -273,6 +323,8 @@ def ensure_fixed_tape_graphs(
             target_tape=target,
             states=states,
             state_to_idx=state_to_idx,
+            edit_targets_py=edit_targets_py,
+            transfer_targets_py=transfer_targets_py,
             divide_targets_py=divide_targets_py,
             active_mask_py=active_mask_py,
             active_mask=active_mask,
@@ -574,14 +626,42 @@ def propagate_likelihood(
     return graph, (branch_values, log_scale + branch_log_scale)
 
 
+def root_rate_matrix(
+    graph: TapeGraphArrays, params: ModelParams, dtype=jnp.float32
+) -> jnp.ndarray:
+    """Build the forward root CTMC rate matrix on predecessor states."""
+    eta = jnp.asarray(params.eta, dtype=dtype)
+    tau = jnp.asarray(params.tau, dtype=dtype)
+    q = jnp.zeros((MAX_STATES, MAX_STATES), dtype=dtype)
+
+    for i, state in enumerate(graph.states):
+        if not graph.active_mask_py[i]:
+            continue
+
+        if state.orientation == TapeState.EVEN:
+            for edit_idx in range(len(params.eta)):
+                j = graph.edit_targets_py[i][edit_idx]
+                if j >= 0 and graph.active_mask_py[j]:
+                    q = q.at[i, j].set(eta[edit_idx])
+
+        j = graph.transfer_targets_py[i]
+        if j >= 0 and graph.active_mask_py[j]:
+            q = q.at[i, j].set(tau)
+
+    row_sums = jnp.sum(q, axis=1)
+    return q.at[jnp.diag_indices(MAX_STATES)].set(-row_sums)
+
+
 def root_initial_frequencies(
     graph: TapeGraphArrays, root_length: jnp.ndarray | float, params: ModelParams
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Integrate the root-start distribution from the empty tape along the root branch."""
+    """Compute P(empty -> state) along the root branch by matrix exponentiation."""
     empty_idx = graph.state_to_idx[TapeState.empty()]
-    d0 = jnp.zeros((MAX_STATES,), dtype=jnp.float32)
-    d0 = d0.at[empty_idx].set(1.0)
-    return integrate_branch(d0, graph, params, root_length)
+    q = root_rate_matrix(graph, params)
+    p = jax.scipy.linalg.expm(q * jnp.asarray(root_length, dtype=q.dtype))[empty_idx]
+    p = jnp.where(graph.active_mask, jnp.maximum(p, 0.0), 0.0)
+    p = p / jnp.maximum(jnp.sum(p), jnp.finfo(p.dtype).tiny)
+    return p, jnp.asarray(0.0, dtype=p.dtype)
 
 
 def combine_with_root_frequencies(
@@ -602,12 +682,14 @@ def combine_with_root_frequencies(
             or not root_graph.active_mask_py[root_idx]
         ):
             continue
+        is_possible = (tree_values[idx] > 0.0) & (root_values[root_idx] > 0.0)
         term = (
             tree_log_scale
             + log_value(tree_values[idx])
             + root_log_scale
             + log_value(root_values[root_idx])
         )
+        term = jnp.where(is_possible, term, -jnp.inf)
         root_log_sum = jax.scipy.special.logsumexp(jnp.array([root_log_sum, term]))
     return root_log_sum
 
@@ -637,10 +719,10 @@ def rec_log_likelihood(
         else:
             left_length = branch_lengths[(node, left)]
             right_length = branch_lengths[(node, right)]
-        (left_graph, (left_vals, left_scales)) = rec_log_likelihood(
+        left_graph, (left_vals, left_scales) = rec_log_likelihood(
             tree, left, left_length, params, tape_graphs, branch_lengths
         )
-        (right_graph, (right_vals, right_scales)) = rec_log_likelihood(
+        right_graph, (right_vals, right_scales) = rec_log_likelihood(
             tree, right, right_length, params, tape_graphs, branch_lengths
         )
         parent_graph, (parent_values, parent_scale) = combine_children(
@@ -680,7 +762,7 @@ def log_likelihood(
     populate_tape_graphs(tree, root, tape_graphs, params)
     ensure_fixed_tape_graphs(tape_graphs, params)
     tree_graph, (tree_values, tree_log_scale) = rec_log_likelihood(
-        tree, root, root_length, params, tape_graphs, branch_lengths
+        tree, root, 0.0, params, tape_graphs, branch_lengths
     )
     root_graph: TapeGraphArrays = tape_graphs.get(tree_graph.target_tape)  # type: ignore
     root_values, root_log_scale = root_initial_frequencies(
@@ -760,7 +842,9 @@ def ultrametric_branch_lengths(
     return jnp.array([heights[u] - heights[v] for u, v in edge_order(tree)])
 
 
-def constrained_branch_lengths(tree: nx.DiGraph, raw_params: ArrayLikeTree) -> jnp.ndarray:
+def constrained_branch_lengths(
+    tree: nx.DiGraph, raw_params: ArrayLikeTree
+) -> jnp.ndarray:
     """Convert raw length parameters into the per-edge lengths used by the ODE."""
     if "height_increments" in raw_params:
         height_increments = positive_transform(
@@ -888,6 +972,7 @@ def optimize_likelihood(
     learning_rate: float = 1e-2,
     steps: int = 100,
     grad_clip_norm: float = 1.0,
+    use_jit: bool = True,
 ) -> tuple[ArrayLikeTree, list[float]]:
     """Optimize the negative log-likelihood with Optax over model and branch parameters."""
     optimizer = optax.chain(
@@ -900,7 +985,6 @@ def optimize_likelihood(
         tree, params, m, dt, tape_graphs
     )
 
-    @eqx.filter_jit
     def step_fn(params, state):
         loss, grads = jax.value_and_grad(loss_fn)(params)
         grads = jax.tree_util.tree_map(
@@ -910,12 +994,14 @@ def optimize_likelihood(
         params = optax.apply_updates(params, updates)
         return params, state, loss
 
+    if use_jit:
+        step_fn = eqx.filter_jit(step_fn)
+
     history: list[float] = []
     params = raw_params
     state = opt_state
     for _ in range(steps):
         params, state, loss = step_fn(params, state)
-        # print("LOSS:", loss)
         history.append(float(loss))
 
     return params, history  # type: ignore
@@ -994,7 +1080,7 @@ def gradient_ablation_diagnostics(
         tree_graph, (tree_values, tree_log_scale) = rec_log_likelihood(
             tree,
             [v for v in tree.nodes if tree.in_degree(v) == 0][0],
-            root_length,
+            0.0,
             model_params,
             tape_graphs,
             branch_length_map(tree, branch_lengths),
@@ -1020,7 +1106,7 @@ def gradient_ablation_diagnostics(
         tree_graph, (tree_values, tree_log_scale) = rec_log_likelihood(
             tree,
             [v for v in tree.nodes if tree.in_degree(v) == 0][0],
-            root_length,
+            0.0,
             model_params,
             tape_graphs,
             branch_length_map(tree, branch_lengths),
@@ -1080,18 +1166,45 @@ def build_test_tree() -> nx.DiGraph:
         (2, 5, 0.9),
         (2, 6, 1.1),
     ]
+    tape = TapeState((1, 2), (1,), 1)
     labeling = [
         (3, TapeState((0, 1), (0,), 1)),
         (4, TapeState((0, 1, 1), (0, 1), 1)),
-        (5, TapeState((1, 2), (1,), 1)),
+        (5, tape),
         (6, TapeState((1, 2), (1, 2), 0)),
     ]
     tree = nx.DiGraph()
+    tapes = []
     for v, label in labeling:
+        tapes.append(label)
         tree.add_node(v, label=label)
 
     for u, v, w in edges:
         tree.add_edge(u, v, weight=w)
+
+    params = ModelParams(
+        rho=0.1,
+        eta=jnp.ones(3, dtype=float),
+        tau=0.2,
+        lambd=1.5,
+        m=3,
+        dt=0.5,
+    )
+
+    tape_graphs = {}
+    populate_tape_graphs(tree, 0, tape_graphs, params)
+
+    for i, s in enumerate(tape_graphs[tape].states):
+        print(i, s)
+    print("Edit targets")
+    for i, s in enumerate(tape_graphs[tape].edit_targets):
+        print(i, s)
+    print("transfer targets")
+    for i, s in enumerate(tape_graphs[tape].transfer_targets):
+        print(i, s)
+    print("divide targets")
+    for i, s in enumerate(tape_graphs[tape].divide_targets):
+        print(i, s)
 
     return tree
 
@@ -1172,5 +1285,6 @@ def test_state_graph():
 if __name__ == "__main__":
     # test_state_graph()
 
-    test_autodif()
+    # test_autodif()
     # find_grad_issue()
+    build_test_tree()

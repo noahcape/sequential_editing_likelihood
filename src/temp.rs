@@ -1,6 +1,5 @@
 /// This file does nothing, just placing old functions here
 
-
 // Solve the ODE system with rk4
 pub fn rk4_fo() {
     let lambda = 1.0;
@@ -314,8 +313,6 @@ pub fn rk4_d_u1() {
     }
 }
 
-
-
 /// Compute the initial density of each state which is the normalized expectation
 /// of the number of extant leaves in that given level at the present time
 pub fn f_i(h: f64, tau: f64, lambda: f64, b_len: f64, t_max: f64, m: usize) -> Vec<f64> {
@@ -467,7 +464,6 @@ fn f_i_values() {
     println!("{:?}", f_i);
     println!("{:?}", f_i.iter().sum::<f64>());
 }
-
 
 // Solve the ODE system with rk4
 pub fn u_temp(

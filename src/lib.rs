@@ -1,7 +1,8 @@
+pub mod binary_characters;
 pub mod ode;
 pub mod opt;
+pub mod simulate;
 pub mod temp;
-pub mod binary_characters;
 
 use rand::SeedableRng;
 use rand::prelude::*;

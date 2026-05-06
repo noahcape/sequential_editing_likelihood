@@ -15,14 +15,13 @@ from model import (
     optimize_likelihood,
     populate_tape_graphs,
 )
-from tree_search import tree_search
-
+import tree_search
 
 
 def plot_convergence_single(history, title, fname):
     x = np.arange(0, len(history))
     plt.figure()
-    plt.plot(x, history, marker="o")
+    plt.plot(x, history, marker="o", markersize=2.5)
     plt.xlabel("Steps")
     plt.ylabel("-log(likelihood)")
     plt.title(title)
@@ -69,8 +68,9 @@ def tree_search_convergence(
     root_length,
     nni_edges,
     num_trees=5,
+    name="",
 ):
-    T, params, ml, history = tree_search(
+    T, params, ml, history = tree_search.tree_search_(
         labels,
         leaves,
         params,
@@ -83,6 +83,7 @@ def tree_search_convergence(
         n=num_trees,
         max_steps=max_steps,
         nni_edges=nni_edges,
+        name=name,
     )
 
     return T, params, ml, history
@@ -119,41 +120,48 @@ def config_best_tree(best_tree, edge_lengths, root_length):
 
 
 if __name__ == "__main__":
-    for seed in range(21, 22):
-        print("Running on simulation:", seed)
-        dt = 0.05
-        m = 10
-        root_length = 5.0
+    seed = 0
+    root_dir = f"./small_simulated_data/{seed}"
+    
+    print("Running on simulation:", seed)
+    dt = 0.05
+    m = 10
+    root_length = 5.0
 
-        file = f"./simulations/{seed}/sampled_leaves.csv"
-        labels, leaves = load_tape_states(file)
+    file = f"{root_dir}/sampled_leaves.csv"
+    labels, leaves = load_tape_states(file)
 
-        # initialize params
-        params = ModelParams(
-            0.1, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 1.0, 1.0, m, dt
-        )
+    # initialize params
+    params = ModelParams(
+        0.1, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 1.0, 1.0, m, dt
+    )
+    # tree search convergence
+    print(params)
 
-        # tree search convergence
-        print(params)
+    if len(labels) > 25:
+        nni_edges = 15
+    else:
+        nni_edges = None
 
-        if len(labels) > 25:
-            nni_edges = 15
-        else:
-            nni_edges = None
+    best_tree, best_params, ml, likelihood_history = tree_search_convergence(
+        labels,
+        leaves,
+        params,
+        1e-2,
+        10,
+        100,
+        1e-10,
+        1.0,
+        20,
+        root_length,
+        nni_edges,
+        5,
+        name=f"{seed}",
+    )
+    params, root_length, _ = constrained_model_params(best_params, m, dt)
+    edge_lengths = constrained_branch_lengths(best_tree, best_params)
 
-        best_tree, best_params, ml, likelihood_history = tree_search_convergence(
-            labels, leaves, params, 1e-2, 10, 500, 1e-10, 1.0, 10, root_length, nni_edges, 10
-        )
-        params, root_length, _ = constrained_model_params(best_params, m, dt)
-        edge_lengths = constrained_branch_lengths(best_tree, best_params)
+    params_to_json(params, f"{root_dir}/reconstructed_params.json")
 
-        params_to_json(params, f"./simulations/{seed}/reconstructed_params.json")
-
-        best_tree = config_best_tree(best_tree, edge_lengths, root_length)
-        print_tree(best_tree, f"./simulations/{seed}/reconstructed_tree.csv")
-
-        plot_convergence_single(
-            likelihood_history,
-            "Tree Search Tree Convergence",
-            f"./simulations/{seed}/tree_search_convergence.png",
-        )
+    best_tree = config_best_tree(best_tree, edge_lengths, root_length)
+    print_tree(best_tree, f"{root_dir}/reconstructed_tree.csv")

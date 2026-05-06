@@ -113,7 +113,9 @@ fn test_hill_climbing() {
     tree.add_label(4, label_3);
 
     let start_likelihood = tree.log_likelihood(0, 1.5, &ModelParams::test());
-    let climbed = tree.hill_climbing(1.5, &ModelParams::test(), 0, 10).unwrap();
+    let climbed = tree
+        .hill_climbing(1.5, &ModelParams::test(), 0, 10)
+        .unwrap();
     let end_likelihood = climbed.log_likelihood(0, 1.5, &ModelParams::test());
 
     assert!(end_likelihood >= start_likelihood);
