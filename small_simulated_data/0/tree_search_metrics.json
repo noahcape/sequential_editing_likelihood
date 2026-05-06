@@ -1,0 +1,14 @@
+{
+  "error": null,
+  "final_neg_log_likelihood": 163.0921630859375,
+  "instance": "0",
+  "output_dir": "/home/nc4935/apc523/sequential_editing_likelihood/small_simulated_data/0",
+  "peak_rss_bytes": 3237171200,
+  "peak_rss_delta_bytes": 3000193024,
+  "peak_rss_delta_mb": 2861.20703125,
+  "peak_rss_mb": 3087.20703125,
+  "process_cpu_seconds": 4546.302831958,
+  "sampled_leaves": 14,
+  "status": "ok",
+  "wall_seconds": 2558.7227717693895
+}
